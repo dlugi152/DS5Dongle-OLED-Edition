@@ -81,7 +81,7 @@ void config_valid() {
     }
     if (body->config_version != CONFIG_VERSION) {
         body->config_version = CONFIG_VERSION;
-        printf("[Config] Warning: Config may breking change\n");
+        printf("[Config] Warning: Config may breaking change\n");
     }
 }
 
