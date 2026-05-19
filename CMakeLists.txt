@@ -146,6 +146,14 @@ if(WAKE_DEBUG)
 endif()
 set(VERSION "dev" CACHE STRING "Program version string")
 
+# Expose VERSION to firmware C++ as FIRMWARE_VERSION so src/oled.cpp's
+# Status header always reflects the release tag (set by release.yml via
+# -DVERSION="$FIRMWARE_VERSION"). Local builds without -DVERSION show
+# "dev" — visible signal that you're not on a tagged release.
+target_compile_definitions(ds5-bridge PRIVATE
+        FIRMWARE_VERSION="${VERSION}"
+)
+
 set_target_properties(ds5-bridge PROPERTIES OUTPUT_NAME "ds5-bridge-oled")
 pico_set_program_name(ds5-bridge "ds5-bridge-oled")
 pico_set_program_version(ds5-bridge "${VERSION}")

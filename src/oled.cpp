@@ -479,7 +479,10 @@ __attribute__((noinline)) void render_screen() {
 
     const bool connected = bt_is_connected();
 
-    draw_text(kContentX, 0, "DS5 Bridge v0.6.0");
+    // FIRMWARE_VERSION is set via CMake from -DVERSION=... on the build
+    // command line (release.yml passes the tag name). Local builds get
+    // "dev" so a non-tagged build is visible at a glance.
+    draw_text(kContentX, 0, "DS5 Bridge " FIRMWARE_VERSION);
     draw_icon(120, 0, connected ? kIconLinkOn : kIconLinkOff, 8, 8);
 
     if (connected) {
