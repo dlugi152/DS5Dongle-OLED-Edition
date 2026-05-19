@@ -114,7 +114,7 @@ target_compile_definitions(wdl_resampler PRIVATE
         WDL_RESAMPLE_TYPE=float
 )
 target_compile_definitions(ds5-bridge PRIVATE
-        CYW43_LWIP=0
+        CYW43_LWIP=1
         ENABLE_SERIAL=${ENABLE_SERIAL_VALUE}
         PICO_FLASH_ASSUME_CORE1_SAFE=1
         WDL_RESAMPLE_TYPE=float
@@ -173,8 +173,8 @@ target_link_libraries(ds5-bridge
         hardware_spi
         hardware_adc
         pico_btstack_classic
-#        pico_cyw43_arch_threadsafe_background
-        pico_cyw43_arch_poll
+        pico_cyw43_arch_lwip_threadsafe_background
+#        pico_cyw43_arch_poll
         pico_btstack_cyw43
         tinyusb_device
         tinyusb_board

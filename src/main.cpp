@@ -237,6 +237,15 @@ int main() {
         printf("Failed to initialize CYW43\n");
         return 1;
     }
+    // Use default interface and station mode
+    cyw43_arch_enable_sta_mode();
+    // Attempt join (blocking call may be platform-specific)
+    
+    if (rc == 0) {
+        printf("board_api_bt: wifi connected\n");
+    } else {
+        printf("board_api_bt: wifi connect failed\n");
+    }
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
 
 #if ENABLE_BATT_LED

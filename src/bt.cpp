@@ -23,6 +23,8 @@
 #include "battery_led.h"
 #endif
 
+#include "lwip/tcp.h"
+
 #define MTU_CONTROL 672
 #define MTU_INTERRUPT 672
 
@@ -68,6 +70,43 @@ static void update_discoverable() {
     } else {
         gap_discoverable_control(0);
     }
+}
+
+static err_t on_sent(void *arg, struct tcp_pcb *tpcb, u16_t len) {
+    tcp_close(tpcb);
+    return ERR_OK;
+}
+
+static err_t on_connected(void *arg, struct tcp_pcb *tpcb, err_t err) {
+    if (err != ERR_OK) {
+        printf("connect error %d\n", err);
+        return err;
+    }
+
+    const char request[] =
+        "GET /api/webhook/pc-turn-on HTTP/1.1\r\n"
+        "Host: 192.168.2.113\r\n"
+        "Connection: close\r\n\r\n";
+
+    tcp_sent(tpcb, on_sent);
+    tcp_write(tpcb, request, strlen(request), TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb);
+
+    return ERR_OK;
+}
+
+void send_webhook() {
+    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+
+    if (!pcb) {
+        printf("pcb create failed\n");
+        return;
+    }
+
+    ip_addr_t ip;
+    IP4_ADDR(&ip, 192, 168, 2, 113);
+
+    tcp_connect(pcb, &ip, 8123, on_connected);
 }
 
 void bt_register_data_callback(bt_data_callback_t callback) {
@@ -345,6 +384,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 bt_rssi = 0;
                 hci_event_connection_complete_get_bd_addr(packet, current_device_addr);
                 printf("[HCI] ACL connected handle=0x%04X\n", handle);
+                send_webhook();
                 printf("[HCI] Request authentication on handle=0x%04X\n", handle);
                 hci_send_cmd(&hci_authentication_requested, handle);
             } else {
