@@ -32,6 +32,24 @@ What we **did not** try (real next steps if anyone picks this up):
 - **BT sniffer** between a PS5 console and a DS5 during voice chat. Tells us exactly what L2CAP channels and bytes Sony uses for mic. Equipment-intensive (~$50–200 for an Ubertooth or commercial sniffer).
 - **DS5 firmware disassembly.** Legally fraught, almost certainly EULA-violating.
 
+## Strongest hypothesis: the channel is encrypted
+
+The shape of all the negative evidence — kernel maintainers giving up, no public RE project succeeding, our matching every documented "enable" bit and getting nothing — strongly suggests the channel is **encrypted with a session key derived during pairing**, not just transported on an undocumented PSM. Sony's incentives line up perfectly:
+
+- **PR / privacy:** a $40 third-party dongle routing a user's PS5 voice chat to a malicious host is a worst-case PR scenario. Encrypting the mic channel is the obvious defense.
+- **GDPR-class regulation:** voice biometrics from a console controller over plaintext BT is the kind of thing EU regulators ask hard questions about.
+- **Anti-spoofing:** prevents injecting fake mic data into a PS5 session, which is its own threat model.
+
+Mechanism that fits the evidence:
+
+- During pairing, BT Classic SSP produces a link key. The PS5 + DS5 firmware likely run a Sony-proprietary KDF on top of that link key to produce an audio-channel session key.
+- Mic audio is transported on a Sony-allocated proprietary L2CAP PSM (not in the standard BT-SIG ranges) and encrypted with that session key (AES-CCM or similar).
+- A third-party dongle could connect to the PSM if it knew the number, but without the KDF / session key the payload would be opaque encrypted blobs.
+
+**Implication:** a BT sniffer might tell us the PSM and packet timing/sizes, but not the payload contents. Building a PS5-impersonating dongle that derives valid session keys would require either Sony system-software disassembly or DS5 firmware disassembly — legally fraught, and a much bigger undertaking than what this project is set up for.
+
+This re-frames "we can't get mic over BT" from "we haven't tried hard enough" to "the architecture is intentionally hardened against exactly this." That's not nothing — it's a clear answer to give users who ask, and a clear bar to clear if anyone wants to actually pursue it.
+
 ## What we built that's useful regardless
 
 These all stay shipped — they're general-purpose audio-debug infrastructure now:
