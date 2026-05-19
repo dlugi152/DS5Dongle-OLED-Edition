@@ -95,6 +95,33 @@ These are non-obvious from the code; they cost time when forgotten.
 - **Inactivity-disconnect uses `packet[3..12]`** in the L2CAP interrupt data path (`src/bt.cpp:l2cap_packet_handler`). It's looking at sticks and DPad/buttons to decide "idle." Don't touch those bytes' layout without updating the heuristic.
 - **The 0x36 BT audio packet layout is load-bearing — speaker + HD haptic actuators silently die without the SetStateData sub-report.** Upstream commit `3a31bd7` (May 2026, "refactor: add SetStateData and audio send priority") moved the `0x10` SetStateData block out of every audio frame and into a one-time L2CAP-open setup. The DualSense hardware requires that sub-report (specifically the `0x7f 0x7f` Headphones + Speaker volume bytes) at `pkt[11..75]` of every `0x36` frame, or the actuators stop producing output even though USB and BT byte counts look fine. Our fork keeps `state_data[63]` in `src/audio.cpp` and re-asserts it on every frame; the pre-3a31bd7 packet layout is: state_data at `pkt[11..75]`, haptic at `pkt[76..141]`, speaker format at `pkt[142]`, opus payload at `pkt[144..343]`. If you rebase onto an upstream that has the refactor and don't preserve this restoration, speaker + HD haptics silently break. The `scripts/test_speaker.sh` helper + the `USB aud / BT 0x32` counters on the OLED Diagnostics screen are the regression tripwire — if bytes are flowing but you hear nothing, look at packet contents not flow. Upstream PR #93 is tracking a proper unified fix; ours is the pre-refactor revert applied just to `audio.cpp`. Same fix was shipped independently by `loteran/DS5Dongle` (commit `c7a8d3c`).
 
+## Versioning — single source of truth
+
+The release tag is the **only** place the version is written. Everything else flows from it:
+
+- **Release tag** (e.g. `v0.6.2-oled-edition`) → created with `git tag` then `gh release create`.
+- **`.github/workflows/release.yml`** picks the tag up as `$FIRMWARE_VERSION` and passes it to CMake via `-DVERSION="$FIRMWARE_VERSION"`.
+- **`CMakeLists.txt`** exposes it to C++ as a compile-time macro:
+  ```cmake
+  target_compile_definitions(ds5-bridge PRIVATE FIRMWARE_VERSION="${VERSION}")
+  ```
+  Local builds without `-DVERSION=...` get the default `"dev"` — that's a deliberate visual signal so an untagged build is obvious on the OLED Status header.
+- **`src/oled.cpp` `render_screen()`** renders `"DS5 Bridge " FIRMWARE_VERSION` for the Status screen header. No string literal for the version exists anywhere else in the firmware source.
+- **Web preview** (`DS5Dongle-OLED-Config-Web`) reads the same tag at runtime from `public/firmware-latest.json`, which CI bundles in `.github/workflows/deploy.yml`'s "Bundle latest firmware UF2 from GitHub releases" step (it pulls from `MarcelineVPQ/DS5Dongle-OLED-Edition/releases/latest` via the GitHub API). `OledEmulator.tsx` fetches that JSON on mount and writes the short form (suffix `-oled-edition` stripped) into `state.firmwareVersionLabel`, which `screens.ts:renderStatus` consumes.
+
+**The release ritual** is therefore:
+
+1. Update `CHANGELOG.md` — move `[Unreleased]` content into a new `[X.Y.Z-oled-edition]` section dated today.
+2. Commit the CHANGELOG bump.
+3. `git tag -a vX.Y.Z-oled-edition -m "..."`
+4. `git push origin master && git push origin vX.Y.Z-oled-edition`
+5. `gh release create vX.Y.Z-oled-edition -R MarcelineVPQ/DS5Dongle-OLED-Edition --title "vX.Y.Z — OLED Edition" --notes "..."`
+6. CI builds the UF2s (~5–7 min), uploads them with SHA256SUMS, edits the release notes to append checksums, and (when `WEB_REPO_DISPATCH_PAT` is configured on the firmware repo — currently unset, see below) fires a `repository_dispatch` event to the web repo to refresh `firmware-latest.json`. Without the secret, the next push to the web repo's `master` does the refresh instead.
+
+There is **no other place** to edit the version. If you find a hardcoded version string in source (`"v0.6.0"`, `"v0.5.4"`, etc.), it's a bug — replace it with the macro / JSON lookup.
+
+**Known follow-up:** `WEB_REPO_DISPATCH_PAT` secret is unset on the firmware repo, so the firmware-release → web-rebuild dispatch is currently silently no-op'd (peter-evans/repository-dispatch with continue-on-error). The web bundle still updates via push events to the web repo's master, but not automatically on every firmware release.
+
 ## Git / branch model
 
 - **`master` (origin)** = `MarcelineVPQ/DS5Dongle-OLED-Edition` (this fork's primary branding, what users download).

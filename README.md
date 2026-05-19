@@ -6,6 +6,26 @@
 
 > **OLED Edition** is a fork of **[awalol/DS5Dongle](https://github.com/awalol/DS5Dongle)** (upstream) that adds an optional Pico-OLED-1.3 128×64 display add-on with 11 screens (status, 4-slot multi-controller pairing, lightbar color picker with favorites and effect presets, trigger test, gyro tilt, touchpad, diagnostics, CPU/clock, BT signal strength, audio VU meters, and a persistent settings menu), plus a DS5 button-combo soft-reboot. Upstream is the authoritative source for the core bridge firmware; this fork tracks it and layers add-on features on top.
 
+---
+
+## 🛠️ Web Config Tool
+
+**[→ Open the OLED Edition Web Config](https://marcelinevpq.github.io/DS5Dongle-OLED-Config-Web/#config)**
+
+The web tool is a one-stop shop — **no installs, no command line, no `picotool`**. A brand-new Pico 2 W can go from "just out of the box" to fully flashed and configured without ever leaving the browser:
+
+- **Flash Firmware tab** — put the Pico in **BOOTSEL mode**, then click *Connect to Pico* in the browser and *Flash now*. The site bundles the latest release UF2, or you can load a local `.uf2` you've built yourself. Powered by WebUSB.
+
+  > **What is BOOTSEL mode?** It's the Pico's built-in flashing mode. To enter it: press and hold the small white button labeled **BOOTSEL** on the Pico, *then* plug the USB cable in (or, if it's already plugged in, briefly disconnect and reconnect while holding BOOTSEL). The Pico will appear to your computer as a removable drive — that's how you know it's in BOOTSEL mode. After the web tool flashes the firmware, the Pico auto-reboots into normal mode and is ready to use.
+- **Config tab** — once the dongle is flashed and reconnected, edit haptics gain, speaker volume, polling rate, audio auto-haptics mode, and the rest of the persistent settings; save to the dongle's flash with one click. Powered by WebHID.
+- **OLED Preview tab** — pixel-perfect emulation of all 11 OLED screens. Use the in-page KEY0/KEY1 buttons (or the controller's △ / R1 / D-pad when a DualSense is paired) to navigate. Adaptive triggers actually fire on the controller when you cycle the Trigger Test preset.
+
+Works in any Chromium-based browser (Chrome, Edge, Brave, Opera). Firefox + Safari don't expose WebHID or WebUSB, so flashing and live config aren't available there — the OLED Preview still renders with mock data.
+
+> Source for the web tool: **[MarcelineVPQ/DS5Dongle-OLED-Config-Web](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Config-Web)** (fork of [awalol/ds5dongle-config-web](https://github.com/awalol/ds5dongle-config-web)).
+
+---
+
 ## Overview
 
 This project enables the Raspberry Pi Pico2W to function as a Bluetooth bridge for the DualSense controller, allowing wireless connectivity with enhanced haptics support.
@@ -27,7 +47,7 @@ This project enables the Raspberry Pi Pico2W to function as a Bluetooth bridge f
 - **Lightbar color picker** with 4 user favorite slots + breathing / rainbow / fade effect presets
 - **Persistent settings menu** for the 8 firmware config fields (haptics gain, speaker volume, polling rate, etc.) with hold-to-confirm Reset and Wipe-all-slots actions
 - **OLED brightness control + auto-dim** after 5 min idle (extends OLED life)
-- **Soft-reboot** without unplugging USB via DS5 `PS + Mute` hold (works headless) or OLED KEY0 double-click
+- **Soft-reboot** without unplugging USB via DS5 `PS + Mute` hold (works headless) or **KEY0 + KEY1 held together for 1 s** on the OLED add-on (replaces the older KEY0 double-click gesture, which was easy to fire by accident while paging quickly)
 - **Audit pass on the core bridge** — critical stack-overflow fix in the audio path (resolves long-standing "audio stuttering"), security hardening, watchdog, length validation across HID/L2CAP boundaries (see [CHANGELOG.md](./CHANGELOG.md))
 
 ## Hardware
@@ -127,16 +147,18 @@ To opt out at build time, configure with `-DENABLE_BATT_LED=OFF`. Default is ON.
 
 ## Performance / Overclocking
 
-Due to encoding requirements, the Pico2W must be overclocked:
+**You don't need to do anything for this — the overclock is baked into the firmware.** When you flash a UF2 from this repo, the Pico 2 W boots at the settings below automatically. There is no separate tool to run, no config file to edit, no fuses to blow.
 
-Current settings:
+Baked-in settings:
 
-- Voltage: 1.2V
-- Frequency: 320 MHz
+- **Voltage: 1.20 V** (`vreg_set_voltage(VREG_VOLTAGE_1_20)`)
+- **Clock: 320 MHz** (`set_sys_clock_khz(SYS_CLOCK_KHZ, true)`)
 
-If your device fails to boot:
+Why it's required: at stock clock/voltage the CYW43 PIO SPI bus (the path the firmware uses to talk to the on-board Bluetooth chip) is unreliable and pairing fails. 320 MHz @ 1.20 V is the lowest combination we've verified to produce a stable BT link on this board.
 
-- Increase voltage slightly or Reduce CPU frequency
+If your device fails to boot a build you compiled yourself (unusual — only relevant when you've changed source), try increasing voltage slightly or lowering the clock in `src/main.cpp`. End users running official UF2 releases should not need to touch this.
+
+A small heatsink on the RP2350 is **recommended for sustained gameplay** but not required for pairing or short sessions.
 
 ## Build Instructions
 
@@ -169,53 +191,25 @@ If you plug a [Waveshare Pico-OLED-1.3](#hardware) onto the Pico2W's headers, th
 
 ### Boot splash (1.5 s on power-on)
 
-```
-┌──────────────────────────────┐
-│                              │
-│         DS5 Bridge           │
-│         Pico2W + OLED        │
-│                              │
-└──────────────────────────────┘
-```
+Centered firmware version on a blank screen for 1.5 seconds, then jumps to the Status screen.
 
-### Ten screens, cycled with KEY0 on the add-on
+### Eleven screens, cycled with KEY0 on the add-on
 
-Cycle order: **Status → Slots → Lightbar → Trigger Test → Gyro Tilt → Touchpad → Diagnostics → RSSI → VU Meters → Settings →** wrap. KEY0 short-press steps forward. KEY1 short-press steps backward (with two contextual exceptions, see the table at the end).
+Cycle order: **Status → Slots → Lightbar → Trigger Test → Gyro Tilt → Touchpad → Diagnostics → CPU/Clock → BT Signal → VU Meters → Settings →** wrap. **KEY0 short-press steps forward; KEY1 short-press steps backward** — on *every* screen. Per-screen interactions (cycling the trigger preset, cycling the lightbar mode, navigating the Settings cursor, switching slots) live on the **DualSense controller buttons**, never on KEY0/KEY1, so the two physical buttons on the OLED add-on always mean the same thing.
+
+Every screen also paints **`>`** at the top-left edge (next to KEY0) and **`<`** at the bottom-left edge (next to KEY1) so the on-screen labels physically pair with the buttons.
 
 #### 1. Status
 
 Connection state, paired DualSense BD address, battery % with bar (`+` charging / `*` complete / `!` error), live analog stick positions, D-pad, face buttons (△ ◯ ✕ □), L1/R1, and L2/R2 analog trigger fill bars. The link indicator and battery use small pixel icons.
 
-```
-┌──────────────────────────────┐
-│ DS5 Bridge v0.6.0         ●  │
-│ 14:3A:9A:FF:D9:F9            │
-│ 87%+ ╔══════════════╗        │
-│      ║██████░░░░░░░░║▌       │
-│ ┌────┐  L1    △     R1 ┌────┐│
-│ │ ·• │  L2  ○   □  R2  │ ·• ││
-│ │    │   ▌    ✕     ▌  │    ││
-│ └────┘                  └────┘│
-└──────────────────────────────┘
-```
-
-<img src="./assets/main_screen_01.jpeg" alt="Status screen on the OLED" width="420">
+<img src="./assets/oled/oled_sc01.jpg" alt="Status screen on the OLED" width="420">
 
 #### 2. Slots
 
 Persistent 4-slot multi-controller pairing. Browse stored controllers, switch active slot, or wipe a single slot. `>` is the cursor, `*` marks the currently active slot.
 
-```
-┌──────────────────────────────┐
-│ Slots         [s0 ON]        │
-│ >0* 14:3A:9A:FF:D9:F9        │
-│  1  (empty)                  │
-│  2  (empty)                  │
-│  3  (empty)                  │
-│                              │
-│ Tri=switch Sq hold=wipe      │
-└──────────────────────────────┘
-```
+<img src="./assets/oled/oled_sc02.jpg" alt="Slots screen on the OLED" width="420">
 
 - **D-pad ▲▼** — move cursor across slots 0–3
 - **△** — switch to the cursor slot (disconnect current, reconnect to slot's stored controller)
@@ -226,42 +220,17 @@ Persistent 4-slot multi-controller pairing. Browse stored controllers, switch ac
 
 Tilt the controller on each axis to dial in R / G / B; the firmware sends the resulting color to the DualSense's actual lightbar at 10 Hz, so the lightbar IS the visual preview (the OLED is monochrome).
 
-```
-┌──────────────────────────────┐
-│ Lightbar        [LIVE]       │
-│ R:128 G: 77 B:200            │
-│ ████░░░  ██░░░░░  ██████░░   │
-│  (R)     (G)      (B)        │
-│ Sv: T=0 C=1 X=2 S=3          │
-│ Tilt = R/G/B                 │
-│ K0=next K1=cycle             │
-└──────────────────────────────┘
-```
-
-<img src="./assets/lightbar_01.jpeg" alt="Lightbar color picker on the OLED" width="420">
+<img src="./assets/oled/oled_sc03.jpg" alt="Lightbar color picker on the OLED" width="420">
 
 - Press **△ ◯ ✕ □** on the controller to **save** the current color into favorite slot 0 / 1 / 2 / 3
-- Press **KEY1** to cycle the mode tag: `[LIVE]` → `[FAV0]` → `[FAV1]` → `[FAV2]` → `[FAV3]` → effects (Breathing / Rainbow / Fade) → back to `[LIVE]`
+- Press **R1** on the controller to cycle the mode tag: `[LIVE]` → `[FAV0]` → `[FAV1]` → `[FAV2]` → `[FAV3]` → effects (Breathing / Rainbow / Fade) → back to `[LIVE]`
 - Default favorites: Red, Green, Blue, White
 
 #### 4. Trigger Test
 
-KEY1 cycles seven adaptive trigger effects applied to both L2 and R2. Pull each trigger to feel the effect.
+Press **△** on the controller to cycle seven adaptive trigger effects applied to both L2 and R2. Pull each trigger to feel the effect.
 
-```
-┌──────────────────────────────┐
-│ Trigger Test                 │
-│ Mode: Weapon                 │
-│ L2: 127   R2:  42            │
-│                              │
-│ ████░░░░░░     ██░░░░░░░░    │
-│  (L2 pull)      (R2 pull)    │
-│                              │
-│ K0=next K1=cycle             │
-└──────────────────────────────┘
-```
-
-<img src="./assets/triggertest_01.jpeg" alt="Trigger Test screen on the OLED" width="420">
+<img src="./assets/oled/oled_sc04.jpg" alt="Trigger Test screen on the OLED" width="420">
 
 Cycle order: **Off → Feedback → Weapon → Vibration → Bow → Gallop → Machine Gun → Off …** Effect parameters bitpacked per [dualsensectl](https://github.com/nowrep/dualsensectl)'s reverse-engineering, all at max strength.
 
@@ -269,69 +238,45 @@ Cycle order: **Off → Feedback → Weapon → Vibration → Bow → Gallop → 
 
 Live X/Y/Z accelerometer values with a 40×40 crosshair box. Tilt the controller and the dot tracks in real time.
 
-```
-┌──────────────────────────────┐
-│ Gyro Tilt                    │
-│ X +123  Y -456  Z +8123      │
-│         ┌────────┐           │
-│         │   │    │           │
-│         │───•────│           │
-│         │   │    │           │
-│         └────────┘           │
-└──────────────────────────────┘
-```
-
-<img src="./assets/gyro_tilt_01.jpeg" alt="Gyro Tilt screen on the OLED" width="420">
+<img src="./assets/oled/oled_sc05.jpg" alt="Gyro Tilt screen on the OLED" width="420">
 
 #### 6. Touchpad
 
 Live render of the touchpad surface. Dots appear at current finger positions; the count updates as fingers touch / leave.
 
-```
-┌──────────────────────────────┐
-│ Touchpad                     │
-│ ┌──────────────────────────┐ │
-│ │    •              •      │ │
-│ │                          │ │
-│ └──────────────────────────┘ │
-│ Fingers: 2                   │
-│                              │
-│ K0=next                      │
-└──────────────────────────────┘
-```
-
-<img src="./assets/touchpad_01.jpeg" alt="Touchpad screen on the OLED" width="420">
+<img src="./assets/oled/oled_sc06.jpg" alt="Touchpad screen on the OLED" width="420">
 
 #### 7. Diagnostics
 
-Uptime, BT state, and stub counters for HCI errors / audio FIFO drops / opus FIFO drops (always 0 in this build — kept for future wiring).
+Uptime, BT state, USB-audio frames/sec, BT 0x32 packets/sec, and HCI error counter — live values for verifying the audio path is moving bytes without needing a UART cable.
 
-```
-┌──────────────────────────────┐
-│ Diagnostics                  │
-│ Up: 0h 14m 22s               │
-│ HCI errs:    0               │
-│ Aud drops:   0               │
-│ Opus drops:  0               │
-│ BT: connected                │
-│                              │
-│ K0=next                      │
-└──────────────────────────────┘
-```
+<img src="./assets/oled/oled_sc07.jpg" alt="Diagnostics screen on the OLED" width="420">
 
-<img src="./assets/diagnostics_01.jpeg" alt="Diagnostics screen on the OLED" width="420">
+#### 8. CPU / Clock
 
-#### 8. RSSI
+Live RP2350 vitals: configured (`Set`) and actually-running (`Real`) system clock measured against the crystal reference, core voltage read back from the regulator, and on-die temperature (256-sample average + slow EMA so the value tracks the real die temp rather than ADC noise).
 
-Live Bluetooth signal strength of the active link, in dBm with a bar. Closer to 0 dBm is stronger; −90 dBm is weak.
+<img src="./assets/oled/oled_sc08.jpg" alt="CPU / Clock diagnostics screen on the OLED" width="420">
 
-#### 9. VU Meters
+The same telemetry is also exported on HID feature report `0xFC` for tooling.
+
+#### 9. BT Signal
+
+Live Bluetooth signal strength of the active link, in dBm with a bar. Closer to 0 dBm is stronger; −90 dBm is weak. Includes a qualitative label (Poor / Fair / Good / Excellent).
+
+<img src="./assets/oled/oled_sc09.jpg" alt="BT Signal screen on the OLED" width="420">
+
+#### 10. VU Meters
 
 Live peak meters for the speaker and haptic audio paths. Useful for verifying audio routing without the controller being plugged in to a host.
 
-#### 10. Settings
+<img src="./assets/oled/oled_sc10.jpg" alt="VU Meters screen on the OLED" width="420">
 
-Persistent config editor. D-pad ▲▼ moves the selection, ▶◀ adjusts values, △ saves to flash. Includes the 8 firmware-config fields (haptics gain, speaker volume, inactive timeout, etc.), the Audio Auto Haptics controls, and two hold-to-confirm actions:
+#### 11. Settings
+
+Persistent config editor. D-pad ▲▼ moves the selection, ▶◀ adjusts values, △ saves to flash. Includes the firmware-config fields (haptics gain, speaker volume, inactive timeout, polling rate), the Audio Auto Haptics controls, and two hold-to-confirm actions:
+
+<img src="./assets/oled/oled_sc11.jpg" alt="Settings screen on the OLED" width="420">
 
 - **AutoHap Off / Fallback / Mix / Replace** — selects the Audio Auto Haptics mode. Default `Fallback` fires derived rumble only when the game sends no native haptic data (e.g. Ghost of Tsushima on Linux); games that *do* send native haptics (Spider-Man Remastered) pass through unchanged. `Mix` adds derived on top of native, `Replace` ignores native entirely, `Off` disables.
 - **AH Gain N%** — derived-signal gain, 0–200 % in 10 % steps. Default 100 %.
@@ -339,15 +284,18 @@ Persistent config editor. D-pad ▲▼ moves the selection, ▶◀ adjusts value
 - **Reset to defaults** — hold △ for 2 s to revert all config fields
 - **Wipe all slots** — hold △ for 2 s to drop all 4 paired controllers + all BTstack link keys
 
-### KEY1 behavior by screen
+### Button reference
 
-| Screen | KEY1 short-press action |
+The two physical buttons on the OLED add-on are **strictly navigation**:
+
+| Button | Action |
 |---|---|
-| Status, Slots, Gyro Tilt, Touchpad, Diagnostics, RSSI, VU Meters, Settings | Step **backward** one screen (mirror of KEY0's forward step) |
-| Trigger Test | Cycle the trigger effect preset |
-| Lightbar Color Picker | Cycle between LIVE preview, the 4 favorite slots, and the effect presets |
+| **KEY0** short-press | Next screen (forward) |
+| **KEY1** short-press | Previous screen (backward) |
+| **KEY1** long-press (≥ 1.5 s) | Cycle OLED brightness level |
+| **KEY0 + KEY1** held together ≥ 1 s | `watchdog_reboot` — soft-reboot without unplugging USB |
 
-KEY1 long-press (≥1.5 s) on any screen cycles the OLED brightness level.
+Per-screen state changes (cycling the trigger preset, cycling the lightbar mode, navigating Settings, switching slots, saving colors to favorite slots) all happen on the **DualSense controller buttons** — never on KEY0 / KEY1 — so the two physical buttons always mean the same thing across every screen. See each screen's section above for which controller button does what.
 
 ### Pinout (standard Waveshare Pico HAT layout)
 
@@ -365,8 +313,8 @@ KEY1 long-press (≥1.5 s) on any screen cycles the OLED brightness level.
 
 Two ways to reboot the dongle without unplugging USB — handy if pairing gets stuck or you want a clean state:
 
-- **OLED KEY0 double-click** within ~400 ms → `watchdog_reboot`
-- **DualSense `PS + Mute` held for 2 seconds** → `watchdog_reboot` (works whether or not the OLED is attached)
+- **OLED KEY0 + KEY1 held simultaneously for ≥ 1 s** → `watchdog_reboot`. Replaces the older "KEY0 double-click" gesture from earlier versions, since rapid forward-navigation kept tripping the double-click timer by accident.
+- **DualSense `PS + Mute` held for 2 seconds** → `watchdog_reboot` (works whether or not the OLED is attached — headless backup).
 
 ## Acknowledgements
 

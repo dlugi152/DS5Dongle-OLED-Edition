@@ -8,6 +8,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ## [Unreleased]
 
+---
+
+## [0.6.3-oled-edition] — 2026-05-18
+
+Small follow-up to v0.6.2. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.3-oled-edition) (built by `.github/workflows/release.yml`).
+
+### Fixed
+
+- **OLED Status header was stuck on `"DS5 Bridge v0.6.0"`.** The string was hardcoded in `src/oled.cpp` and never got bumped per release, so v0.6.1 and v0.6.2 both shipped with stale text on the Status screen. Now driven by a compile-time `FIRMWARE_VERSION` macro set from `CMakeLists.txt`'s `${VERSION}` (which `release.yml` already passes as `-DVERSION="$FIRMWARE_VERSION"`). Single source of truth: the release tag. Local builds without `-DVERSION` show `"dev"` so an untagged build is obvious at a glance.
+- **Web preview's Status header had the same bug.** `src/oled/screens.ts` hardcoded `"v0.5.4"`. Now reads `firmware-latest.json` (already CI-bundled from the GitHub API) at runtime in `OledEmulator.tsx` and writes the short tag (suffix `-oled-edition` stripped) into `state.firmwareVersionLabel`, which `renderStatus()` consumes.
+
+### Documentation
+
+- New `CLAUDE.md` "Versioning — single source of truth" section documents the release ritual (CHANGELOG bump → tag → push → `gh release create`) and the single-source-of-truth flow from tag → CMake → C++ macro → web `firmware-latest.json`. Includes a note about the still-pending `WEB_REPO_DISPATCH_PAT` secret on the firmware repo.
+
+---
+
+## [0.6.2-oled-edition] — 2026-05-18
+
+OLED button-model + visual chrome refactor on top of v0.6.1. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.2-oled-edition) (built by `.github/workflows/release.yml`).
+
+### Changed (button model)
+
+- **KEY0 / KEY1 are now strictly navigation on every screen.** KEY0 short-press = next screen, KEY1 short-press = previous screen. KEY1 long-press still cycles OLED brightness (unchanged). The old contextual K1=cycle behavior on Trigger Test (cycle trigger preset) and Lightbar (cycle lightbar mode) moved to **DualSense controller buttons** — Triangle on Trigger Test, R1 on Lightbar. Source of "the Mode label didn't change when I clicked K1" confusion eliminated.
+- **KEY0 double-click reboot → KEY0 + KEY1 simultaneous hold (≥ 1 s).** Rapid forward-navigation kept tripping the double-click timer by accident, soft-rebooting the dongle mid-session. The new two-button chord can't be fat-fingered. `kDoubleClickUs` + `key0_pending_single` state removed; new `chord_held_since_us` + `kChordHoldUs = 1 s`. DS5 PS+Mute hold-2 s remains the headless backup.
+- **Per-screen contextual actions on the controller** mirror the existing Slots / Settings conventions (where Triangle has always meant "commit / switch / save"):
+  - **Trigger Test** — △ rising edge cycles `trigger_preset` and re-applies via `send_trigger_effect()`.
+  - **Lightbar** — R1 rising edge cycles `lb_mode`. (Triangle stays as "save current RGB to favorite slot 0" — the existing favorite-save UX.)
+
+### Changed (visual chrome)
+
+- **Arrow chrome on the left edge of every screen.** `flush_fb()` now paints `>` at `(0, 8)` and `<` at `(0, 49)` so the on-screen labels physically pair with the KEY0 (top) and KEY1 (bottom) buttons. The horizontal `"K0=next K1=back"` footer at y=56 is removed from all 11 screens. Trigger Test footer = `"Tri=cycle"`; Lightbar footer = `"R1=mode"`; Slots and Settings keep their existing contextual hints (`"Tri=switch Sq hold=wipe"`, `"DP nav/adj Tri=save"`). New `kContentX = 6` shifts every screen's content right by 6 px to clear the chrome strip; rectangles, sticks, and the L1/L2 column on Status all repositioned to avoid the chrome `<` glyph painting inside the live left-stick area.
+
+### Added (web preview parity)
+
+- **`src/protocol/ds5BridgeHid.ts` `sendTriggerPreset(preset)`** — builds the DS5 SetStateData payload byte-for-byte from `src/oled.cpp send_trigger_effect()` and pushes via `device.sendReport(0x02, ...)`. The dongle relays it over BT to the paired controller, so cycling Trigger Test in the web preview actually drives the real adaptive triggers.
+- **Web preview mirrors the firmware refactor.** `key1Action()` collapsed to back-nav-only. New rising-edge handlers in `OledEmulator.tsx` detect Triangle / R1 / D-pad from the live controller's input report and dispatch to the appropriate per-screen action. `drawButtonChrome(fb)` paints the `>` / `<` arrows after every render. `flush()` accepts an optional tint color: Slots / Diagnostics / CPU/Clock render in **orange** (`#f59e0b`) when a controller is connected — Chrome WebHID can't expose those reports on a stock DualSense descriptor, so the orange tint + an explanatory paragraph below the canvas flag the values as mock. KEY0/KEY1 buttons in the UI moved to sit visually next to the rendered Pico-OLED-1.3, mirroring the physical board.
+- **Settings cursor on the web** — new `settingsSel` state, `>` cursor mark on the selected row; D-pad up/down on the connected controller moves the cursor (web-preview-only — actual edits + save happen via the dedicated Config tab on the website).
+- **Mock-data temperature tweak** — web Preview's CPU/Clock screen no longer drifts 41–47 °C; jitter is now ±0.4 °C around 33.6 °C (realistic Pico 2 W idle).
+
+### Documentation
+
+- **README "Web Config Tool" section** added near the top, linking https://marcelinevpq.github.io/DS5Dongle-OLED-Config-Web/#config and explaining the three tabs (Flash / Config / OLED Preview). Includes a BOOTSEL mode primer for first-time flashers.
+- **OLED Display Add-on section rewritten.** Screen count 10 → 11 (CPU/Clock added). Cycle order updated. New "Button reference" table covers the strict K0/K1 nav, K1 long-press brightness, and K0+K1 chord reboot. ASCII mockups dropped in favor of consistent web-preview screenshots under `assets/oled/`.
+- **Performance / Overclocking section reworded** to lead with "you don't need to do anything — the overclock is baked into the firmware". The "raise voltage / lower clock if it fails to boot" line is scoped to users compiling from source.
+
+---
+
+## [0.6.1-oled-edition] — 2026-05-18
+
+Tagged release of the v0.6.0-oled-edition follow-up. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.1-oled-edition) (built by `.github/workflows/release.yml`).
+
 ### Added
 
 - **CPU / Clock diagnostics screen** (`kScreenCpu`, inserted between Diagnostics and BT Signal in the K0 cycle). Shows the configured system clock (`SYS_CLOCK_KHZ` — the overclock target), the *actually running* `clk_sys` measured live by the RP2350 on-chip frequency counter against the crystal reference, the core voltage read back from the regulator (`vreg_get_voltage()`, not the compile-time constant), and the RP2350 on-die temperature (ADC input 4). Pure read-only instrumentation; one-time ADC bring-up and no other code path uses the ADC, so it is conflict-free. `render_screen_cpu()` is `noinline` like the other render functions (Thumb literal-pool reach). Adds `hardware_adc` to `target_link_libraries`. The frequency-counter measurement (a multi-ms busy-wait) runs **once on screen entry** and is cached — `clk_sys` is fixed at boot, so only the temperature refreshes per frame, avoiding a per-frame BT/audio hitch while the screen is visible. `oled_loop()` gained a generic `screen_entered` flag for this. Hardware-verified on Pico 2 W + OLED. Also exported over a new HID feature report **`0xfc`** (`src/cmd.cpp`) — 11 bytes: set_khz, cached real_khz, vreg code, ADC ch4 raw — so the web config emulator can show live CPU telemetry (volts/temp math done web-side to keep the firmware HID path float-free).
