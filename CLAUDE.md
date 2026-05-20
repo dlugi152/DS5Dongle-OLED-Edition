@@ -66,6 +66,8 @@ The development cadence is **one feature per UF2 + checkpoint with the user befo
 
 **OLED add-on is optional and self-contained:** All 10 screens, the SH1107 SPI driver, the 5×7 font, the icon table, and the input handling live in `src/oled.cpp` (~30 KB). The only outward dependencies are read-only accessors (`bt_is_connected`, `bt_get_addr`, `audio_peak_*`, `bt_get_signal_strength`, the new slot accessors) and the global `interrupt_in_data[63]` (read-only for input visualization). When no OLED is wired, the SPI writes go nowhere — no init check needed.
 
+**Idle power ladder (`oled_loop` tail):** Three-stage state machine (`OLED_ACTIVE` → `OLED_DIM` → `OLED_OFF`) driven by `last_activity_us`. `kAutoDimUs = 2 min` enters Dim — the regular per-screen render is replaced with `render_dim_pulse()`, which clears the framebuffer and walks a 2×2 dot through 8 positions every 30 s, blinking 1 s on / 1 s off. `kAutoOffUs = 15 min` enters Off — `cmd(0xAE)` puts the SH1107 to sleep and `oled_loop` returns early before rendering. Wakes on KEY0/KEY1 (via `handle_buttons` bumping `last_activity_us`), `bt_is_connected()` rising edge, or any change in the `interrupt_in_data[0..9]` hash. The dim tier uses `flush_fb_raw()` (the chrome-less variant) since there's no nav target while asleep. **Why this shape:** the SH1107 contrast register has a heavily non-linear perceptual curve on the Waveshare panel — even `0x02` looks ~90 % as bright as `0xFF`. The only reliable "dim" available is rendering fewer pixels.
+
 **Multi-slot pairing (Phase G):** Storage is two-tier:
 
 - **Link keys** stay in BTstack's TLV NVM (4 slots, unchanged from upstream).
@@ -136,6 +138,7 @@ When asked to modify behavior, the *first* file to read is usually one of:
 
 - New BT pairing / connection state behavior → `src/bt.cpp` (HCI + L2CAP event handlers).
 - New OLED screen or change to existing one → `src/oled.cpp`.
+- New diagnostic counter on the OLED Diagnostics screen → bump `kNumDiagRows` in `src/oled.cpp` and add a `case` to `format_diag_row()` (single switch, one row per case). The screen scrolls automatically; no D-pad wiring needed. Counters that need rate-per-second arithmetic should be sampled in `sample_diag_rates()` and read from `g_diag_rates`. Counter globals themselves typically live in `src/main.cpp` next to `g_bt_31_packets` etc. with `extern` declarations near the top of `src/oled.cpp`.
 - New persistent config field → `src/config.h` (struct), `src/config.cpp:config_valid()` (defaults + clamping), `src/oled.cpp:format_settings_item()` (UI), `src/oled.cpp:settings_adjust()` (D-pad ▶◀ behavior). Update `CHANGELOG.md`.
 - USB descriptor or interface change → `src/usb_descriptors.cpp` + `src/tusb_config.h`.
 - Audio / haptic path → `src/audio.cpp`. **Don't** add stack arrays sized smaller than the resampler / Opus expects (this is the C1 bug that caused the long-standing "audio stuttering" issue — fix landed in upstream `5b04cbd`, but the lesson stands).

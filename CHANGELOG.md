@@ -8,6 +8,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ## [Unreleased]
 
+### Added
+
+- **OLED idle power ladder.** Replaces the single-tier 5-min auto-dim with a three-stage state machine: at 2 min idle the panel wipes black and a 2×2 "breathing dot" (1 s on / 1 s off) walks through 8 evenly-spaced positions every 30 s; at 15 min idle the SH1107 is sent `cmd(0xAE)` (display off) entirely. Wakes instantly on KEY0/KEY1, controller pair (BT-connect rising edge), or any input-report change. Why this shape: on the Waveshare panel, bench-testing `kDimContrast = 0x10` and `0x02` both produced only ~10 % perceptual reduction (SH1107's contrast register vs apparent brightness is heavily non-linear on this hardware), so the only reliable per-pixel dim available is *rendering fewer pixels*. The breathing dot lights ~4 of 8 192 pixels half the time — roughly a 1 000× drop in cumulative current — while still indicating "the dongle is alive," and the rotating position spreads OLED wear across the panel.
+- **Trigger-flow diagnostic counters on the Diagnostics screen.** `host02` (total `0x02` HID OUT reports from host) / `trig` (those where the host set `AllowRight|LeftTriggerFFB` in `valid_flag0`) / `tx` (forwarded as BT `0x31` sub-`0x10`). Added in response to issue #3 ("trigger tension missing in Death Stranding 2"). Lets the user triage in one game session whether the dongle, the host driver, or the controller is the source of the missing adaptive-trigger effect — without a UART or BT sniffer.
+- **Diagnostics screen now scrolls with the controller D-pad.** Refactored to a row-list (10 rows currently: Uptime / BT state / host02 / trig+tx / BT31 in/s / USB aud/s / BT32 out/s / Mic in/s / Mic dec=&w= / Mic prefix). 5 rows visible at a time; ▲/▼ glyphs at the right edge mark "more above/below." Read-only — no cursor, unlike Settings, since there's nothing to select.
+
+### Changed
+
+- **`flush_fb()` split.** Internal refactor: `flush_fb_raw()` writes just the framebuffer; `flush_fb()` is now `draw_button_chrome() + flush_fb_raw()`. Lets the dim-tier renderer push the breathing dot without the K0/K1 chrome arrows (no navigation target while the panel is asleep).
+- **Diagnostics row order re-prioritized.** The first 5 rows (always visible without scrolling) cover the most common triage path: Uptime / BT state / `host02` / `trig`+`tx` / `BT31 in/s`. Audio + parked-mic-investigation counters live below the fold.
+
 ---
 
 ## [0.6.3-oled-edition] — 2026-05-18

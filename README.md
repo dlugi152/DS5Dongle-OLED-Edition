@@ -46,7 +46,7 @@ This project enables the Raspberry Pi Pico2W to function as a Bluetooth bridge f
 - **4-slot persistent multi-controller pairing** — bond up to four DualSenses, switch between them from the OLED, slot 0 reconnects automatically on boot
 - **Lightbar color picker** with 4 user favorite slots + breathing / rainbow / fade effect presets
 - **Persistent settings menu** for the 8 firmware config fields (haptics gain, speaker volume, polling rate, etc.) with hold-to-confirm Reset and Wipe-all-slots actions
-- **OLED brightness control + auto-dim** after 5 min idle (extends OLED life)
+- **OLED idle power ladder** — manual brightness cycle (KEY1 long-press), automatic deep-dim with a small breathing dot at 2 min idle, full display-off at 15 min idle. Wakes instantly on button, controller pair, or input. Real burn-in protection, not just a contrast tweak.
 - **Soft-reboot** without unplugging USB via DS5 `PS + Mute` hold (works headless) or **KEY0 + KEY1 held together for 1 s** on the OLED add-on (replaces the older KEY0 double-click gesture, which was easy to fire by accident while paging quickly)
 - **Audit pass on the core bridge** — critical stack-overflow fix in the audio path (resolves long-standing "audio stuttering"), security hardening, watchdog, length validation across HID/L2CAP boundaries (see [CHANGELOG.md](./CHANGELOG.md))
 
