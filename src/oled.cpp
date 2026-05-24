@@ -273,6 +273,16 @@ void rect_filled(int x, int y, int w, int h) {
             px(x + i, y + j, true);
 }
 
+// XOR-invert every pixel in a region (used to flash a control "pressed").
+void rect_invert(int x, int y, int w, int h) {
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            const int xx = x + i, yy = y + j;
+            if (xx < 0 || xx >= kW || yy < 0 || yy >= kH) continue;
+            fb[yy * kRowBytes + (xx / 8)] ^= 1 << (7 - (xx % 8));
+        }
+}
+
 void draw_char(int x, int y, char c) {
     if (c < 0x20 || c > 0x7E) return;
     const uint8_t *g = kFont5x7[c - 0x20];
@@ -694,11 +704,15 @@ __attribute__((noinline)) void render_screen() {
         int lx = (kContentX + 2) + (interrupt_in_data[0] * 27) / 255;
         int ly = 32 + (interrupt_in_data[1] * 27) / 255;
         rect_filled(lx - 1, ly - 1, 3, 3);
+        // L3 (left stick click) — invert the whole box as a pressed indicator.
+        if (interrupt_in_data[8] & 0x40) rect_invert(kContentX, 30, 32, 32);
 
         rect_outline(96, 30, 32, 32);
         int rx = 98 + (interrupt_in_data[2] * 27) / 255;
         int ry = 32 + (interrupt_in_data[3] * 27) / 255;
         rect_filled(rx - 1, ry - 1, 3, 3);
+        // R3 (right stick click) — invert the whole box.
+        if (interrupt_in_data[8] & 0x80) rect_invert(96, 30, 32, 32);
 
         // L2/R2 analog trigger bars (vertical, fill from bottom). L2 sits
         // just right of the shifted left stick box.
