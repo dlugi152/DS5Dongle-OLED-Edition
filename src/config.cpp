@@ -95,6 +95,24 @@ void config_valid() {
         body->auto_haptics_lowpass = 1; // 160 Hz
         printf("[Config] auto_haptics_lowpass invalid, defaulting to 1 (160 Hz)\n");
     }
+    if (body->lightbar_mode > 8) { // 0..7 OLED modes + 8 = HOST passthrough (default)
+        body->lightbar_mode = 8;
+        printf("[Config] lightbar_mode invalid, defaulting to 8 (HOST passthrough)\n");
+    }
+    // lb_fav_{r,g,b} need no validation — any 0..255 is a legal color, and an
+    // erased flash sector (0xFF) yields 4 white favorites, a usable default.
+    if (body->screen_dim_timeout > 250) { // 0xFF erased / out of range → default
+        body->screen_dim_timeout = 2;     // mirrors the original 2-min dim tier
+        printf("[Config] screen_dim_timeout invalid, defaulting to 2 min\n");
+    }
+    if (body->screen_off_timeout > 250) {
+        body->screen_off_timeout = 15;    // mirrors the original 15-min off tier
+        printf("[Config] screen_off_timeout invalid, defaulting to 15 min\n");
+    }
+    if (body->bt_mic_enable > 1) {        // 0xFF erased / upgrade → default ON
+        body->bt_mic_enable = 1;
+        printf("[Config] bt_mic_enable invalid, defaulting to 1 (on)\n");
+    }
     if (body->config_version != CONFIG_VERSION) {
         body->config_version = CONFIG_VERSION;
         printf("[Config] Warning: Config may breaking change\n");

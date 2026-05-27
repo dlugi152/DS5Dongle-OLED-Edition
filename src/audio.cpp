@@ -13,6 +13,7 @@
 #include "utils.h"
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
+#include "pico/time.h"
 #include "config.h"
 #include "state_mgr.h"
 #include "usb.h"
@@ -25,6 +26,14 @@
 // #define VOLUME_GAIN       2
 // #define BUFFER_LENGTH     48
 
+// DualSense microphone, ported from awalol/DS5Dongle's `mic` branch.
+// The DS5 sends mic audio as Opus packets embedded in BT input report
+// 0x31 when bit 1 of byte 2 is set; payload is 71 bytes of Opus at
+// offset 4, decoded to mono 48 kHz 10 ms frames (480 samples).
+#define MIC_CHANNELS      1
+#define MIC_FRAMES        480
+#define MIC_OPUS_SIZE     71
+
 using std::clamp;
 using std::max;
 
@@ -36,6 +45,39 @@ alignas(8) static uint32_t audio_core1_stack[8192];
 queue_t audio_fifo;
 static uint8_t opus_buf[200];
 critical_section_t opus_cs;
+
+// Mic ingress queue — filled from on_bt_data() (BT poll, core0), drained
+// at the top of audio_loop() on core0. The decoder is single-threaded
+// (core0 only), so no critical section is needed around it.
+queue_t mic_fifo;
+struct mic_element { uint8_t data[MIC_OPUS_SIZE]; };
+static OpusDecoder *mic_decoder = nullptr;
+static volatile uint32_t g_mic_frames = 0;
+static volatile int32_t  g_mic_last_decoded = 0;  // opus_decode return value
+static volatile uint16_t g_mic_last_want = 0;     // bytes we asked TinyUSB to send
+static volatile uint16_t g_mic_last_wrote = 0;    // bytes TinyUSB accepted
+uint32_t audio_mic_frames() { return g_mic_frames; }
+int32_t  audio_mic_last_decoded() { return g_mic_last_decoded; }
+uint16_t audio_mic_last_want()    { return g_mic_last_want; }
+uint16_t audio_mic_last_wrote()   { return g_mic_last_wrote; }
+
+// Mic jitter buffer + packet-loss concealment. Decoded mono frames land here
+// (filled as Opus arrives, drained at a steady 10 ms playout cadence) so bursty
+// BT delivery is smoothed and a dropped frame is concealed via Opus PLC instead
+// of underrunning the host with a click/hole. Design ported from
+// SundayMoments/DS5_Bridge (credit there). PLC keeps voice continuous on a
+// lossy BT link (e.g. controller moved away, USB 3.0 RF interference).
+struct mic_decoded_element { int16_t mono[MIC_FRAMES]; };
+static queue_t mic_decode_fifo;
+static constexpr int      MIC_DECODE_DEPTH  = 8;       // jitter-buffer capacity (frames)
+static constexpr int      MIC_PLAYOUT_START = 3;       // pre-buffer before playout begins
+static constexpr uint64_t MIC_FRAME_US      = 10000;  // 10 ms per Opus frame @ 48 kHz
+static constexpr uint64_t MIC_SESSION_US    = 300000; // no real frame this long → stop playout
+static bool     mic_playout_started = false;
+static uint64_t mic_next_playout_us = 0;
+static uint64_t mic_last_real_us    = 0;
+static volatile uint32_t g_mic_plc_frames = 0;        // concealed frames generated (Diag)
+uint32_t audio_mic_plc_frames() { return g_mic_plc_frames; }
 
 struct audio_raw_element {
     float data[512 * 2];
@@ -73,9 +115,140 @@ uint8_t audio_peak_haptic() {
     return (uint8_t)(v >> 7);
 }
 
+// Most-recent Opus TOC byte (first byte of the packet). Used by the OLED
+// Diagnostics screen to decode the frame's bandwidth + duration config
+// without serial.
+static volatile uint8_t g_mic_toc = 0;
+uint8_t audio_mic_last_toc() { return g_mic_toc; }
+
+// Push a 71-byte Opus mic packet from the BT handler into the mic_fifo.
+// Called from src/main.cpp's on_bt_data() when the DS5 sends a mic-tagged
+// 0x31 input report. Drops the oldest queued packet if the FIFO is full —
+// preferring fresh audio over backlog on overload.
+void mic_add_queue(const uint8_t *data) {
+    static mic_element packet{};
+    memcpy(packet.data, data, MIC_OPUS_SIZE);
+    g_mic_toc = data[0]; // first byte of the Opus packet
+    if (queue_is_full(&mic_fifo)) queue_try_remove(&mic_fifo, NULL);
+    queue_try_add(&mic_fifo, &packet);
+}
+
+// Re-assert the DS5 mic-enable (pkt[4] bit 0) so the controller streams its mic
+// even when no audio is being output to it. Normally the enable only rides the
+// 0x36 audio frames, which are gated on active USB audio — so without this, mic
+// only works while a game plays sound. The enable is sticky (the DS5 keeps
+// streaming once it starts), so we send a control-only 0x36 (enable + the
+// load-bearing SetStateData sub-report + a silent haptic block, no speaker
+// payload → makes no sound) at ~4 Hz ONLY until mic frames start arriving, then
+// stop — minimizing BT traffic and DS5 battery. Resumes if the stream stalls.
+static void mic_enable_keepalive() {
+    if (!bt_is_connected() || !get_config().bt_mic_enable) return;
+    const uint64_t now = time_us_64();
+    static uint32_t last_frames = 0;
+    static uint64_t last_frame_us = 0;
+    static uint64_t last_send_us = 0;
+    const uint32_t frames = g_mic_frames;
+    if (frames != last_frames) { last_frames = frames; last_frame_us = now; }
+    if (last_frame_us != 0 && (now - last_frame_us) < 1000000ULL) return; // streaming → sticky, no resend
+    if (last_send_us != 0 && (now - last_send_us) < 250000ULL) return;    // throttle to ~4 Hz while arming
+    last_send_us = now;
+
+    uint8_t pkt[REPORT_SIZE]{};
+    pkt[0] = REPORT_ID;
+    pkt[1] = reportSeqCounter << 4;
+    reportSeqCounter = (reportSeqCounter + 1) & 0x0F;
+    pkt[2] = 0x11 | 1 << 7;
+    pkt[3] = 7;
+    pkt[4] = 0b11111111; // mic-enable (bit 0)
+    const auto buf_len = get_config().audio_buffer_length;
+    pkt[5] = pkt[6] = pkt[7] = pkt[8] = pkt[9] = buf_len;
+    pkt[10] = packetCounter++;
+    pkt[11] = 0x10 | 1 << 7; // SetStateData sub-report (load-bearing — keeps actuators alive)
+    pkt[12] = 63;
+    state_set(pkt + 13, 63);
+    pkt[76] = 0x12 | 1 << 7;  // haptic sub-report; samples left zero = silent
+    pkt[77] = SAMPLE_SIZE;
+    // no speaker sub-report (pkt[142..] stays zero) → control-only, no audio out
+    bt_write(pkt, sizeof(pkt));
+    g_bt_packets++;
+}
+
 void audio_loop() {
+    // Mic-in path: pull one Opus packet from the BT-side FIFO, decode to
+    // mono PCM, duplicate to stereo (our UAC1 endpoint declares 2 channels),
+    // push to the host via tud_audio_write. Runs once per loop iteration so
+    // it keeps up with the ~100 Hz arrival rate of mic-tagged BT frames.
+    if (mic_decoder != nullptr) {
+        const uint64_t now = time_us_64();
+
+        // Decode stage: drain incoming Opus into the jitter buffer as fast as it
+        // arrives (absorbs bursty BT delivery), up to the buffer's capacity.
+        static mic_element pkt{};
+        while (queue_get_level(&mic_decode_fifo) < MIC_DECODE_DEPTH
+               && queue_try_remove(&mic_fifo, &pkt)) {
+            static mic_decoded_element dec{};
+            const int n = opus_decode(mic_decoder, pkt.data, MIC_OPUS_SIZE,
+                                      dec.mono, MIC_FRAMES, 0);
+            g_mic_last_decoded = n; // observed in OLED Diag
+            if (n > 0) {
+                queue_try_add(&mic_decode_fifo, &dec);
+                mic_last_real_us = now;
+            }
+        }
+
+        // Playout stage: emit one frame every 10 ms. Pre-buffer a few frames to
+        // absorb jitter, then play a real frame if buffered, else conceal with an
+        // Opus PLC frame during an active session (transient loss) so the host
+        // hears continuity instead of a hole. If real frames have been gone for a
+        // while (mic off/idle), stop so we don't emit comfort noise forever.
+        if (!mic_playout_started
+            && queue_get_level(&mic_decode_fifo) >= MIC_PLAYOUT_START) {
+            mic_playout_started = true;
+            mic_next_playout_us = now;
+        }
+        if (mic_playout_started && (int64_t)(now - mic_next_playout_us) >= 0) {
+            static mic_decoded_element out{};
+            bool have = queue_try_remove(&mic_decode_fifo, &out);
+            if (!have) {
+                if (now - mic_last_real_us < MIC_SESSION_US) {
+                    const int n = opus_decode(mic_decoder, nullptr, 0,
+                                              out.mono, MIC_FRAMES, 0); // PLC
+                    if (n > 0) { have = true; g_mic_plc_frames++; }
+                } else {
+                    mic_playout_started = false; // session ended — re-buffer next time
+                }
+            }
+            if (have) {
+                static int16_t stereo[MIC_FRAMES * 2];
+                for (int i = 0; i < MIC_FRAMES; i++) {
+                    stereo[i * 2]     = out.mono[i];
+                    stereo[i * 2 + 1] = out.mono[i];
+                }
+                const uint16_t want = (uint16_t)(MIC_FRAMES * 2 * sizeof(int16_t));
+                g_mic_last_wrote = tud_audio_write(stereo, want);
+                g_mic_last_want  = want;
+                g_mic_frames++;
+                mic_next_playout_us += MIC_FRAME_US;
+                // Drift guard: if we've fallen many frames behind (loop stall),
+                // resync the cadence instead of bursting to catch up.
+                if ((int64_t)(now - mic_next_playout_us) > (int64_t)(4 * MIC_FRAME_US)) {
+                    mic_next_playout_us = now + MIC_FRAME_US;
+                }
+            }
+        }
+    }
+
     // 1. 读取 USB 音频数据
-    if (!tud_audio_available()) return;
+    if (!tud_audio_available()) {
+        // Keep the DS5 mic streaming even without output audio — but ONLY once
+        // the host has enumerated us (tud_mounted). Running it during the
+        // fresh-pair feature handshake floods BT TX and delays controller-type
+        // detection past the connection watchdog's timeout, which then tears the
+        // link down (~10-15s "shutdown" on fresh pair). After enumeration the
+        // handshake is done, so it's safe — and always-on mic still works.
+        if (tud_mounted()) mic_enable_keepalive();
+        return;
+    }
 
     int16_t raw[192];
     uint32_t bytes_read = tud_audio_read(raw, sizeof(raw)); // 每次读入 384 bytes
@@ -209,7 +382,10 @@ void audio_loop() {
         reportSeqCounter = (reportSeqCounter + 1) & 0x0F;
         pkt[2] = 0x11 | 0 << 6 | 1 << 7;
         pkt[3] = 7;
-        pkt[4] = 0b11111110;
+        // bit 0 = mic-enable: tells the DS5 to stream its mic over BT (awalol
+        // confirmed this is the key). Bits 1-7 are the pre-existing speaker/
+        // haptic audio-enable flags. Gated on the bt_mic_enable config toggle.
+        pkt[4] = get_config().bt_mic_enable ? 0b11111111 : 0b11111110;
         const auto buf_len = get_config().audio_buffer_length;
         pkt[5] = buf_len;
         pkt[6] = buf_len;
@@ -253,6 +429,17 @@ void audio_init() {
     critical_section_init(&opus_cs);
     multicore_launch_core1_with_stack(core1_entry, audio_core1_stack, sizeof(audio_core1_stack));
 #endif
+
+    // Mic path: queue + decoder live on core0 (audio_loop), separate from
+    // the core1 speaker encoder. Mic Opus is mono / 48 kHz / 10 ms frames.
+    queue_init(&mic_fifo, sizeof(mic_element), MIC_DECODE_DEPTH);          // deeper: tolerate BT bursts
+    queue_init(&mic_decode_fifo, sizeof(mic_decoded_element), MIC_DECODE_DEPTH); // decoded-PCM jitter buffer
+    int dec_error = 0;
+    mic_decoder = opus_decoder_create(48000, MIC_CHANNELS, &dec_error);
+    if (dec_error != 0 || mic_decoder == nullptr) {
+        printf("[Audio] OpusDecoder create failed (err=%d)\n", dec_error);
+        mic_decoder = nullptr;  // ensure audio_loop's null-guard short-circuits
+    }
 }
 
 static OpusEncoder *encoder;

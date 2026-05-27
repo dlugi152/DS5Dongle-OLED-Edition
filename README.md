@@ -18,6 +18,7 @@ The web tool is a one-stop shop — **no installs, no command line, no `picotool
 
   > **What is BOOTSEL mode?** It's the Pico's built-in flashing mode. To enter it: press and hold the small white button labeled **BOOTSEL** on the Pico, *then* plug the USB cable in (or, if it's already plugged in, briefly disconnect and reconnect while holding BOOTSEL). The Pico will appear to your computer as a removable drive — that's how you know it's in BOOTSEL mode. After the web tool flashes the firmware, the Pico auto-reboots into normal mode and is ready to use.
 - **Config tab** — once the dongle is flashed and reconnected, edit haptics gain, speaker volume, polling rate, audio auto-haptics mode, and the rest of the persistent settings; save to the dongle's flash with one click. Powered by WebHID.
+- **Remap tab** — visual button remapper: click a button on a live DualSense diagram to reassign it to any other (the shoulders/triggers float to the corners as labeled glyphs). The map is stored on the dongle and applied before the host sees the report, so it works in every game and on every OS. Powered by WebHID.
 - **OLED Preview tab** — pixel-perfect emulation of all 11 OLED screens. Use the in-page KEY0/KEY1 buttons (or the controller's △ / R1 / D-pad when a DualSense is paired) to navigate. Adaptive triggers actually fire on the controller when you cycle the Trigger Test preset.
 
 Works in any Chromium-based browser (Chrome, Edge, Brave, Opera). Firefox + Safari don't expose WebHID or WebUSB, so flashing and live config aren't available there — the OLED Preview still renders with mock data.
@@ -43,10 +44,11 @@ This project enables the Raspberry Pi Pico2W to function as a Bluetooth bridge f
 **OLED Edition additions:**
 
 - Optional Pico-OLED-1.3 status display with **11 screens** (status, slots, lightbar, trigger test, gyro tilt, touchpad, diagnostics, CPU/clock, RSSI, VU meters, settings)
+- **Button remapping** — reassign any of the 16 digital controls (face buttons, D-pad, shoulders/triggers, stick clicks, Create/Options) to any other. Stored on the dongle and applied before the host sees the report, so it works in **every game and OS with no host-side software**; identity (no remap) is the default. Edit it visually in the [web config tool](#️-web-config-tool)'s **Remap tab**, or headlessly via `scripts/remap_test.py`. Persisted in its own flash sector, survives reboot.
 - **4-slot persistent multi-controller pairing** — bond up to four DualSenses, switch between them from the OLED, slot 0 reconnects automatically on boot
 - **Lightbar color picker** with 4 user favorite slots + breathing / rainbow / fade effect presets
 - **Persistent settings menu** for the 8 firmware config fields (haptics gain, speaker volume, polling rate, etc.) with hold-to-confirm Reset and Wipe-all-slots actions
-- **OLED brightness control + auto-dim** after 5 min idle (extends OLED life)
+- **OLED idle power ladder** — manual brightness cycle (KEY1 long-press), automatic deep-dim with a small breathing dot at 2 min idle, full display-off at 15 min idle. Wakes instantly on button, controller pair, or input. Real burn-in protection, not just a contrast tweak.
 - **Soft-reboot** without unplugging USB via DS5 `PS + Mute` hold (works headless) or **KEY0 + KEY1 held together for 1 s** on the OLED add-on (replaces the older KEY0 double-click gesture, which was easy to fire by accident while paging quickly)
 - **Audit pass on the core bridge** — critical stack-overflow fix in the audio path (resolves long-standing "audio stuttering"), security hardening, watchdog, length validation across HID/L2CAP boundaries (see [CHANGELOG.md](./CHANGELOG.md))
 
@@ -140,10 +142,44 @@ When the connected DualSense reports its battery at or below 10% (and it is not 
 
 To opt out at build time, configure with `-DENABLE_BATT_LED=OFF`. Default is ON.
 
+## DualSense Microphone over Bluetooth
+
+**The DualSense's built-in microphone works over the dongle's Bluetooth pairing** (since v0.6.8). The controller streams its mic as Opus audio; the dongle decodes it and presents it to the host as the standard DualSense USB capture device, so any app (Discord, OBS, in-game voice) can use it like a normal microphone.
+
+This was long believed impossible — earlier versions of this fork documented it as a hard Sony-firmware limitation (and the Linux `hid-playstation` kernel driver still doesn't support it). It turned out to hinge on a single enable bit in the dongle's outbound audio report. **Full credit to [awalol](https://github.com/awalol/DS5Dongle) (upstream) for identifying it.** The corrected investigation log lives in [BLUETOOTH_AUDIO_NOTES.md](./BLUETOOTH_AUDIO_NOTES.md).
+
+**Using it:**
+
+- **On by default.** Pair the controller and the mic begins streaming within a second or two — no game audio required (the dongle keeps the stream alive on its own).
+- **Raise the capture volume on the host** — it defaults low. On Linux, find the card with `arecord -l`, then e.g. `amixer -c <DualSense card> sset 'Headset' 90%`. Verify capture with `scripts/mic_diag.sh capture`.
+- **Toggle it off to save controller battery** — OLED **Settings → BT Mic**, or the **BT microphone** switch in the [web config tool](#web-config-tool). Always-on mic keeps the DS5's audio subsystem awake, which drains its battery noticeably faster, so disable it if you don't use voice.
+
+**Caveats:**
+
+- Mic audio is **mono** (decoded mono, duplicated across the stereo capture endpoint).
+- Toggling off mid-session stops the host feed immediately, but the controller keeps streaming until it next reconnects (there's no known "stop" command); connecting fresh with the toggle off never enables it.
+- The OLED **Diagnostics** screen's `Mic in:` counter reads ~100/s while the mic is streaming — a quick way to confirm it's live.
+- **Packet-loss concealment:** dropped mic frames (weak BT link, distance, interference) are concealed with Opus PLC so voice stays continuous instead of clicking/cutting out, at a small jitter-buffer latency (~30 ms). The Diag screen's `Mic PLC:` counter climbs only when frames are being concealed — effectively a live link-quality gauge.
+
 ## Known Issues
 
 - Overclocking to 320 MHz @ 1.20 V is **required** for stable BT pairing. Dropping voltage to 1.10 V or clock to stock breaks the CYW43 PIO SPI bus and BT stops working. A small heatsink on the RP2350 is recommended for sustained gameplay.
 - HD haptics may not fire in every game on Linux + Steam; this is game-side (some titles only send HD-haptic audio under Windows-specific APIs). Tested working in Spider-Man Remastered; not delivered in Ghost of Tsushima — same firmware, same controller.
+- **USB 3.0 ports can disrupt pairing** — the controller may get stuck on a solid amber/yellow lightbar and never connect, while the same dongle works fine on a USB 2.0 port. This is RF interference, not a firmware bug; see [USB 3.0 ports & Bluetooth interference](#usb-30-ports--bluetooth-interference) below. (As of v0.6.8 the firmware auto-retries a stalled connection instead of hanging, which recovers many — but not all — marginal cases.)
+
+## USB 3.0 ports & Bluetooth interference
+
+If the dongle works on one port but not another, **try a USB 2.0 port first.** USB 3.0 ports and (especially) USB 3.0 extension cables emit broadband RF noise centered near 2.4 GHz — the same band the dongle's Bluetooth radio uses to talk to the controller. This is a well-documented industry issue (Intel, *"USB 3.0 Radio Frequency Interference Impact on 2.4 GHz Wireless Devices"*), not specific to this firmware. The noise desensitizes the dongle's BT receiver, so the controller can start connecting (amber lightbar) but the link is too noisy to complete — it hangs on yellow.
+
+Mitigations, roughly in order of effectiveness:
+
+1. **Plug the dongle into a USB 2.0 port** (often the simplest fix — many motherboards/cases have both).
+2. **Use a short USB 2.0 extension cable** to get the dongle a few inches away from the USB 3.0 ports / metal chassis, improving line-of-sight to the controller. Avoid USB 3.0 extension cables specifically.
+3. **Use a powered USB 2.0 hub** plugged into the USB 3.0 port — the hub downshifts the link and adds distance.
+4. **Clip a ferrite bead** onto the cable near the dongle.
+5. **Keep the controller closer / in line of sight** of the dongle during pairing.
+
+The firmware will keep retrying a stalled connection on its own, so leaving it plugged in for ~10–20 s after the lightbar goes amber may let it recover without a replug.
 
 ## Performance / Overclocking
 
@@ -185,6 +221,34 @@ Build flags worth knowing:
 - `-DENABLE_SERIAL=ON` — route printf to USB CDC for debugging (default OFF; releases UART for production builds).
 - `-DPICO_W_BUILD=ON` — build for the original Pico W (drops audio, lowers clock). Default targets Pico 2 W.
 
+## Diagnostics & debug tooling
+
+Two ways to triage bridge issues — on-device via the OLED Diagnostics screen, and host-side via `scripts/mic_diag.sh` (Linux). The host-side path is faster: no screen-switching, no flash cycle, runs while the controller is in active use.
+
+```
+# One-shot snapshot — is the dongle on USB? Did ALSA enumerate it? Is the
+# capture stream live? Is a controller currently paired?
+scripts/mic_diag.sh status
+
+# 3-second arecord on the mic IN endpoint — reports peak / RMS / non-zero
+# count so we can tell "stream is silent" from "stream is producing audio".
+scripts/mic_diag.sh capture 3
+
+# Same as `status` but in a loop, prints only on state change. Useful for
+# catching the exact second pairing completes or audio streams open / close.
+scripts/mic_diag.sh watch
+
+# Live read of the firmware's 0xFD vendor feature report (via /dev/hidraw):
+# BT input counts + rates, last seen non-0x31 IDs, byte prefixes, AND the
+# trigger-flow counters (host 0x02 received / with AllowTriggerFFB set /
+# forwarded to BT). bt-trace prints a verdict — "host driver isn't sending
+# trigger Allow bits" vs "forwarded but controller didn't actuate" — which
+# is what would otherwise need a USB protocol analyzer.
+scripts/mic_diag.sh bt-trace
+```
+
+Originally written to triage the parked DS5 BT-microphone investigation (see [BLUETOOTH_AUDIO_NOTES.md](./BLUETOOTH_AUDIO_NOTES.md)). The `0xFD` feature report and `bt-trace` decoder now also carry the trigger-flow counters added for [issue #3](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/issues/3) (missing adaptive trigger tension in some games).
+
 ## OLED Display Add-on (optional)
 
 If you plug a [Waveshare Pico-OLED-1.3](#hardware) onto the Pico2W's headers, the firmware drives it automatically as a live status display. No configuration needed — the firmware no-ops gracefully when no OLED is present.
@@ -201,7 +265,7 @@ Every screen also paints **`>`** at the top-left edge (next to KEY0) and **`<`**
 
 #### 1. Status
 
-Connection state, paired DualSense BD address, battery % with bar (`+` charging / `*` complete / `!` error), live analog stick positions, D-pad, face buttons (△ ◯ ✕ □), L1/R1, and L2/R2 analog trigger fill bars. The link indicator and battery use small pixel icons.
+Connection state, paired DualSense BD address, battery % with bar (`+` charging / `*` complete / `!` error), live analog stick positions (each stick box flashes inverse — a black dot on a white box — while its **L3 / R3** is clicked in), D-pad, face buttons (△ ◯ ✕ □), L1/R1, and L2/R2 analog trigger fill bars. The link indicator and battery use small pixel icons. While charging, a `~Nm` estimate of the time to 100% appears next to the battery.
 
 <img src="./assets/oled/oled_sc01.jpg" alt="Status screen on the OLED" width="420">
 
@@ -236,7 +300,7 @@ Cycle order: **Off → Feedback → Weapon → Vibration → Bow → Gallop → 
 
 #### 5. Gyro Tilt
 
-Live X/Y/Z accelerometer values with a 40×40 crosshair box. Tilt the controller and the dot tracks in real time.
+Live X/Y/Z accelerometer values with a 40×40 crosshair box. The dot tracks the controller's tilt in real time and **sits centered when the controller lies flat** — it's driven by the controller's own per-unit factory IMU calibration (parsed from feature report `0x05`), so the rest position and gain are correct on every controller. Tilting left/right and forward/back moves the dot in the matching direction.
 
 <img src="./assets/oled/oled_sc05.jpg" alt="Gyro Tilt screen on the OLED" width="420">
 
@@ -248,7 +312,9 @@ Live render of the touchpad surface. Dots appear at current finger positions; th
 
 #### 7. Diagnostics
 
-Uptime, BT state, USB-audio frames/sec, BT 0x32 packets/sec, and HCI error counter — live values for verifying the audio path is moving bytes without needing a UART cable.
+Scrollable list of live counters — uptime, BT state, host → BT trigger flow (`host02` / `trig` / `tx`), BT 0x31 input rate, USB audio frames/sec, BT 0x32 packets/sec, and parked mic-investigation counters at the bottom. Controller D-pad ▲/▼ scrolls; tiny `^` / `v` glyphs at the right edge mark "more above/below." Read-only, so no cursor. Useful for verifying the bridge is moving bytes without needing a UART cable.
+
+The same counters are also exported on HID feature report `0xFD` for host-side tooling — see `scripts/mic_diag.sh bt-trace` below.
 
 <img src="./assets/oled/oled_sc07.jpg" alt="Diagnostics screen on the OLED" width="420">
 

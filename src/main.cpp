@@ -22,6 +22,7 @@
 #include "battery_led.h"
 #endif
 #include "oled.h"
+#include "remap.h"
 
 // Pico SDK speciifically for waiting on conditions
 #include "pico/critical_section.h"
@@ -29,6 +30,58 @@
 int reportSeqCounter = 0;
 uint8_t packetCounter = 0;
 bool spk_active = false;
+
+// Mic-debug instrumentation: count every 0x31 BT input report regardless
+// of mic-tag bit, accumulate OR-mask of every byte-2 value seen (tells us
+// which bits ever fire) and remember the last byte-2 value. Also track
+// observed frame-length range. Surfaced on the OLED Diagnostics screen.
+volatile uint32_t g_bt_31_packets = 0;
+volatile uint32_t g_bt_other_packets = 0;
+volatile uint8_t  g_last_other_id = 0;
+volatile uint8_t  g_other_id_or = 0;
+volatile uint8_t  g_last_31_b2 = 0;
+volatile uint8_t  g_31_b2_or = 0;
+volatile uint16_t g_31_len_min = 0xFFFF;
+volatile uint16_t g_31_len_max = 0;
+volatile uint8_t  g_mic_prefix[6] = {0};
+volatile uint8_t  g_last_other_prefix[8] = {0};
+volatile uint8_t  g_last_any_prefix[16] = {0};
+volatile uint16_t g_longest_len = 0;
+volatile uint8_t  g_longest_frame[80] = {0};
+uint32_t bt_31_packet_count() { return g_bt_31_packets; }
+uint8_t  bt_31_last_byte2()  { return g_last_31_b2; }
+uint8_t  bt_31_b2_or_mask()  { return g_31_b2_or; }
+uint16_t bt_31_len_min()     { return g_31_len_min == 0xFFFF ? 0 : g_31_len_min; }
+uint16_t bt_31_len_max()     { return g_31_len_max; }
+void bt_31_mic_prefix(uint8_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = g_mic_prefix[i];
+}
+
+// Trigger-flow diagnostics. Counts host → dongle → BT path for adaptive
+// trigger effects. Lets us tell which link in the chain breaks when games
+// like Death Stranding 2 don't produce trigger tension via the dongle:
+//   out02_total     - every 0x02 HID OUT report received from host
+//   out02_trig_allow - of those, how many set AllowRight/LeftTriggerFFB
+//                     (valid_flag0 bits 2 & 3) — i.e. the host actually
+//                     told us "apply trigger FFB"
+//   out02_to_bt     - 0x02 reports that we forwarded to the controller as
+//                     a BT 0x31 sub-0x10 packet (gated off when speaker is
+//                     active; audio.cpp's 0x36 path carries state then)
+//   out02_trig_folded - of the trig_allow reports, how many arrived while the
+//                     speaker stream was active and were therefore NOT sent as
+//                     a standalone 0x31 — their trigger FFB was folded into the
+//                     0x36 audio frames via state[]. So trig_allow == to_bt's
+//                     trigger share + this, proving the "missing" forwards
+//                     (issue #6) aren't drops. Surfaced on the Diag screen.
+// Surfaced on the OLED Diagnostics screen.
+volatile uint32_t g_host_out02_total = 0;
+volatile uint32_t g_host_out02_trig_allow = 0;
+volatile uint32_t g_host_out02_to_bt = 0;
+volatile uint32_t g_host_out02_trig_folded = 0;
+uint32_t host_out02_total()       { return g_host_out02_total; }
+uint32_t host_out02_trig_allow()  { return g_host_out02_trig_allow; }
+uint32_t host_out02_to_bt()       { return g_host_out02_to_bt; }
+uint32_t host_out02_trig_folded() { return g_host_out02_trig_folded; }
 
 uint8_t interrupt_in_data[63] = {
     0x7f, 0x7d, 0x7f, 0x7e, 0x00, 0x00, 0xa7,
@@ -66,7 +119,12 @@ void interrupt_loop() {
 
     // TODO: Refactor for better code reuse
     if (get_config().polling_rate_mode != 2) {
-        if (!tud_hid_report(0x01, interrupt_in_data, 63)) {
+        // Remap acts on the OUTGOING copy only — interrupt_in_data stays raw so
+        // the reboot combo above and every OLED screen keep seeing physical input.
+        uint8_t out[63];
+        memcpy(out, interrupt_in_data, 63);
+        remap_apply(out);
+        if (!tud_hid_report(0x01, out, 63)) {
             printf("[USBHID] tud_hid_report error\n");
         }
         return;
@@ -85,6 +143,9 @@ void interrupt_loop() {
     }
     critical_section_exit(&report_cs);
 
+    // Remap the snapshot, not interrupt_in_data (outgoing copy only — see above).
+    if (should_send) remap_apply(safe_report);
+
     // Only send to TinyUSB if we actually grabbed fresh data
     if (should_send) {
         if (!tud_hid_report(0x01, safe_report, 63)) {
@@ -101,6 +162,61 @@ void interrupt_loop() {
 
 void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {
     // printf("[Main] BT data callback: channel=%u len=%u\n", channel, len);
+    // Track ALL INTERRUPT input reports, not just 0x31. The mic stream
+    // may live on a different report ID — confirmed 2026-05-19 that data[2]
+    // bit 0 (and bit 1) is NOT a mic flag, just the report-type indicator;
+    // every "mic-tagged" frame turned out to be standard input.
+    if (channel == INTERRUPT && len > 1) {
+        if (data[1] == 0x31) g_bt_31_packets++;
+        else {
+            g_bt_other_packets++;
+            g_last_other_id = data[1];
+            g_other_id_or = (uint8_t)(g_other_id_or | data[1]);
+            for (uint16_t i = 0; i < 8 && i < len; i++) {
+                g_last_other_prefix[i] = data[i];
+            }
+        }
+        if (len > 2) {
+            g_last_31_b2 = data[2];
+            g_31_b2_or = (uint8_t)(g_31_b2_or | data[2]);
+        }
+        if (len < g_31_len_min) g_31_len_min = len;
+        if (len > g_31_len_max) g_31_len_max = len;
+        for (uint16_t i = 0; i < 16 && i < len; i++) {
+            g_last_any_prefix[i] = data[i];
+        }
+
+        // Capture the entire content of the longest 0x31 frame we've
+        // seen. Long frames almost certainly carry the mic audio appended
+        // after the standard 63-byte input report — this lets us look
+        // at the trailing bytes directly via 0xFD diagnostic.
+        if (data[1] == 0x31 && len > g_longest_len) {
+            g_longest_len = len;
+            for (uint16_t i = 0; i < 80 && i < len; i++) {
+                g_longest_frame[i] = data[i];
+            }
+        }
+    }
+
+    // Mic-in tap (TEST): once the dongle asserts the mic-enable bit in the
+    // outgoing 0x36 audio report (pkt[4] bit 0, see audio.cpp — awalol
+    // confirmed this is the key), the DS5 streams its mic as a 71-byte Opus
+    // packet at data+4 of a 0x31 report with bit 1 of data[2] set. Route those
+    // to the mic decoder instead of treating them as a standard input report.
+    // The length guard (4-byte header + 71-byte Opus) keeps a stray short
+    // frame from over-reading. The diagnostic counters above still observe
+    // these frames, so the Diag screen's data[2] OR-mask will show bit 1 set
+    // once the enable bit takes effect.
+    // A mic-tagged 0x31 frame carries Opus audio at data+4, NOT a standard input
+    // report — so it must ALWAYS be diverted here (decoded when mic is on, dropped
+    // when off), never fall through to the input handler below. Letting it through
+    // would copy Opus bytes into interrupt_in_data and corrupt sticks/buttons.
+    if (channel == INTERRUPT && data[1] == 0x31 && ((data[2] >> 1) & 1)
+        && len >= 75) {
+        if (get_config().bt_mic_enable) mic_add_queue(data + 4);
+        return;
+    }
+
     if (channel == INTERRUPT && data[1] == 0x31) {
         if ((data[56] & 1) != (interrupt_in_data[53] & 1)) {
             set_headset(data[56] & 1);
@@ -114,12 +230,6 @@ void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {
             return;
         }
 
-        // We add the critical section here to avoid any race conditions when writing to the interrupt_in_data buffer,
-        // which is shared between the main loop and this callback. 
-        // The critical section ensures that only one thread can access the buffer at a time, 
-        // preventing data corruption and ensuring thread safety.   
-        // We also set the report_dirty flag to true to indicate that new data is available
-        //  and needs to be sent in the next interrupt report.
         critical_section_enter_blocking(&report_cs);
         memcpy(interrupt_in_data, data + 3, 63);
         report_dirty = true;
@@ -186,8 +296,19 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
     if (report_id == 0) {
         switch (buffer[0]) {
             case 0x02: {
+                g_host_out02_total++;
+                // valid_flag0 lives at buffer[1] (right after the 0x02 report id).
+                // Bits 2 & 3 are AllowRight/LeftTriggerFFB.
+                if (bufsize > 1 && (buffer[1] & 0x0C)) {
+                    g_host_out02_trig_allow++;
+                }
                 state_update(buffer + 1, bufsize - 1);
                 if (spk_active) {
+                    // Not forwarded as a standalone 0x31 — the trigger FFB just
+                    // written into state[] rides the 0x36 audio frames instead.
+                    // Count the trigger-bearing ones so the Diag screen shows
+                    // trig_allow == to_bt(trig) + folded (issue #6: not drops).
+                    if (bufsize > 1 && (buffer[1] & 0x0C)) g_host_out02_trig_folded++;
                     break;
                 }
                 uint8_t outputData[78]{};
@@ -200,6 +321,7 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
                 // memcpy(outputData + 3, buffer + 1, bufsize - 1);
                 state_set(outputData + 3,sizeof(SetStateData));
                 bt_write(outputData, sizeof(outputData));
+                g_host_out02_to_bt++;
                 break;
             }
         }
@@ -273,6 +395,7 @@ int main() {
     critical_section_init(&report_cs);
 
     config_load();
+    remap_load();
 
     bt_init();
     bt_register_data_callback(on_bt_data);
@@ -290,6 +413,7 @@ int main() {
         watchdog_update();
 #endif
         cyw43_arch_poll();
+        bt_connection_watchdog_tick();
         tud_task();
         audio_loop();
         interrupt_loop();

@@ -10,6 +10,130 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ---
 
+## [0.6.10-oled-edition] — 2026-05-25
+
+Headline: the **Gyro Tilt screen** is now actually usable — it applies the controller's per-unit factory **IMU calibration**, the dot **centres when the controller lies flat**, and tilt **tracks the direction** you move it. Also adds an **L3 / R3 stick-click indicator** on the Status screen and makes the **charge-ETA** robust so it no longer over-reports off a single slow charge step. Everything here is on-dongle display only — **what games receive is unchanged** (the full gyro/accel stream is still forwarded byte-for-byte). UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.10-oled-edition) (built by `.github/workflows/release.yml`).
+
+### Added
+
+- **L3 / R3 click indicator on the OLED Status screen.** Clicking a stick in now flashes its analog-stick box inverse (white box, black dot) for as long as it's held — previously the stick clicks had no on-screen feedback. Mirrored in the web config tool's OLED Preview.
+
+### Changed
+
+- **Gyro Tilt screen reworked: per-unit IMU calibration, a tilt dot that centres when flat, and intuitive direction.** Three things, all display-only — the host input report (all gyro + accel axes) is still forwarded byte-for-byte, so in-game motion is unaffected:
+  - **Calibration.** The DualSense ships factory gyro/accel bias + sensitivity in feature report `0x05` (which the dongle already fetches and caches at connect). Previously the tilt visuals used raw accel counts; now the cached `0x05` is parsed once per connection (re-read per controller, so it stays correct across the 4 pairing slots) and applied as `(raw − bias) × sensitivity`, keeping the same ±8192 ≈ 1 g scale. A bad/short read is rejected (same sanity gate SDL uses) and it falls back to raw — no regression when calibration is unavailable. The tilt→RGB lightbar mode uses the corrected accel too. Parse/apply mirror SDL's `SDL_hidapi_ps5.c` (zlib-licensed; credit).
+  - **Centred when flat.** The dot is now driven by the X (roll) and **Z** (pitch) axes — the two that read ~0 when the controller lies flat — instead of X/Y. Gravity rests on Y when flat, so the old Y mapping pegged the dot to the bottom edge at rest; it now sits centred.
+  - **Direction follows the controller.** Both axes are negated so tilting left moves the dot left and tilting forward moves it up, instead of mirrored.
+  - The dot centring + direction are mirrored in the web config tool's OLED Preview (its mock IMU now also rests gravity on Y to match real hardware).
+
+### Fixed
+
+- **Charge-ETA no longer balloons off a single slow 10% step.** The Status-screen `~Nm` charge estimate timed each 10% battery step and projected the rest, but one anomalously slow step (e.g. ~47 min — observed reading `~222m` at 70% on the dock) used to drag the whole projection up because the rate was a mean over only 3 steps. Each timed step's bulk-equivalent is now clamped to a 30-min ceiling and the rate is taken as the **median** over the last 5 steps, so a single under-load/anomalous reading can't dominate. Mirrored in the web OLED Preview emulator.
+
+---
+
+## [0.6.9-oled-edition] — 2026-05-24
+
+Headline feature: **on-dongle button remapping** — reassign any of the 16 digital controls, stored on the dongle so it works in every game and on every OS with no host-side software, edited visually in the web config tool's new **Remap** tab (a click-the-controller diagram built on Zacksly's CC BY 3.0 DualSense art). Also ships **packet-loss concealment** for the BT microphone. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.9-oled-edition) (built by `.github/workflows/release.yml`); this is the first release without the debug UF2 as a download.
+
+### Added
+
+- **Button remapping.** Any of the 16 digital controls (face buttons, D-pad, shoulders/triggers, stick clicks, Create/Options) can be remapped to any other — stored on the dongle, applied transparently before the host sees the report, so it works on every OS and every game with no host-side software. The remap table lives in its own dedicated flash sector (`PICO_FLASH_SIZE_BYTES - 3·FLASH_SECTOR_SIZE`, magic `DS5\x03`, below the slots sector) and survives reboot; identity (no remap) is the default. Multiple sources mapping to one target OR together (analog L2/R2 take the max); a source can be set to *disabled* (`0xFF`). The remap acts on the **outgoing host report copy only** — the raw input the OLED screens and the PS+Mute reboot combo read is untouched. Edited over the existing `0xF6`/`0xF7` vendor reports with a hardened `RM`+version frame (**no HID-descriptor change**, so Windows enumeration is unaffected) and a revision counter the host polls to confirm a write landed. New `src/remap.{h,cpp}`; apply logic + button set ported from [SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge) (credit). Dev helper `scripts/remap_test.py` exercises the path over `/dev/hidraw` without the web tool.
+
+### Changed
+
+- **BT microphone now has packet-loss concealment (PLC).** The mic decode path gained a small decoded-frame jitter buffer (8 frames) drained at a steady 10 ms playout cadence: bursty BT delivery is smoothed, and a dropped mic frame during an active session is concealed with an Opus PLC frame (`opus_decode(decoder, NULL, 0, …)`) instead of leaving a hole the host hears as a click/dropout. Playout pre-buffers 3 frames and stops after 300 ms of no real frames (so it never emits comfort noise when the mic is idle). A new **`Mic PLC:`** counter on the Diagnostics screen climbs only when concealment fires — effectively a live BT link-quality gauge. Verified: forced BT loss kept the captured audio gap-free (longest zero-run ~0 ms) while the counter climbed. Design ported from [SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge) (credit). Adds ~30 ms mic latency (the pre-buffer).
+
+### Companion web tool
+
+- **Visual button-remapping editor (new Remap tab).** `DS5Dongle-OLED-Config-Web` gains a dedicated **Remap** tab built on the new firmware remap protocol: click a button on a live, theme-aware DualSense diagram to reassign it, with the shoulders/triggers (L1/L2/R1/R2) floated to the corners as labeled glyphs + leader lines (they have no target in a front view). Remapped/selected buttons glow; a collapsible full dropdown list is kept as a fallback. Reads the remap block appended to the `0xF7` config response and writes over `0xF6` (func `0x10`), independent of `Config_body`. Controller outline + button glyphs are [Zacksly's "PS5 Button Icons and Controls"](https://zacksly.itch.io/ps5-button-icons-and-controls) (CC BY 3.0, recolored to `currentColor` and cropped), credited in the footer, each asset file, and a bundled license. Strings translated across all 7 locales.
+
+---
+
+## [0.6.8-oled-edition] — 2026-05-24
+
+Two big items: **DualSense microphone over Bluetooth** (long believed impossible — turned out to be a single enable bit; credit [awalol](https://github.com/awalol/DS5Dongle) upstream) and a **USB 3.0 connection-interference watchdog**. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.8-oled-edition) (built by `.github/workflows/release.yml`). The companion `DS5Dongle-OLED-Config-Web` config tool gains a **BT microphone** toggle.
+
+### Added
+
+- **DualSense microphone over Bluetooth.** The controller's built-in mic now works over the dongle's BT pairing — decoded from the DS5's Opus stream and presented to the host as the standard DualSense USB capture device, usable by any app (Discord, OBS, in-game voice). This fork had previously documented BT mic as a hard Sony-firmware limitation (likely encrypted); that conclusion was **wrong** — it hinged on a single enable bit (`pkt[4]` bit 0 in the outbound `0x36` audio report). Credit to **[awalol](https://github.com/awalol/DS5Dongle)** (upstream) for identifying it. The DS5 streams mic as 71-byte Opus packets tagged in `0x31` reports (`(data[2]>>1)&1`); `src/audio.cpp` decodes mono→stereo to the UAC1 endpoint. **Always-on:** the enable is sticky once streaming, so a control-only `0x36` keep-alive asserts it at ~4 Hz only until frames arrive, then backs off — mic works with no game audio, at minimal BT traffic. **Toggle:** new `bt_mic_enable` config field (default on; off saves DS5 battery since always-on keeps its audio subsystem awake) — OLED **Settings → BT Mic** and the web config tool's **BT microphone** switch. `BLUETOOTH_AUDIO_NOTES.md` rewritten from "dead end" to the working mechanism; README gains a user-facing **"DualSense Microphone over Bluetooth"** section.
+
+### Fixed
+
+- **Connection no longer hangs permanently on the amber lightbar (USB 3.0 interference recovery).** Users reported the DualSense getting stuck mid-connect (solid amber/yellow, never enumerates) on USB 3.0 host ports while USB 2.0 worked — caused by USB 3.0's broadband ~2.4 GHz RF noise desensitizing the CYW43 Bluetooth radio. The firmware's connection flow had dead-end states (ACL-fail and auth-fail re-inquiry were commented out; the controller-type feature-packet wait had no timeout), so a single lost packet stalled forever until a replug. Added a **connection-attempt watchdog** (`src/bt.cpp`): a 10 s timeout armed when a connection commits to a device and cleared when it reaches USB enumeration; on expiry it tears down via the existing `HCI_EVENT_DISCONNECTION_COMPLETE` path and restarts inquiry, so a stalled connect auto-retries instead of hanging. Re-enabled the ACL-fail / create-connection-reject / auth-fail recovery paths for faster recovery when the controller *does* report a failure. The watchdog is inert during a healthy established session (no effect on normal play, slot-switching, or idle-disconnect). Helps any marginal-RF setup, not just USB 3.0.
+
+### Documentation
+
+- New README section **"USB 3.0 ports & Bluetooth interference"** + a Known Issues bullet: explains the 2.4 GHz RFI cause (referencing Intel's white paper) and lists mitigations (USB 2.0 port, short USB 2.0 extension cable, powered USB 2.0 hub, ferrite bead, distance/line-of-sight).
+
+---
+
+## [0.6.7-oled-edition] — 2026-05-23
+
+UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.7-oled-edition) (built by `.github/workflows/release.yml`).
+
+### Changed
+
+- **Charge ETA now shows a provisional estimate immediately on plug-in.** Instead of sitting on `~--m` for the ~15-20 min until the first 10% step is timed, the Status screen shows a default-rate estimate `~Nm?` (the trailing `?` marks it provisional) the moment charging starts. The `?` drops and the number switches to the measured rate once a clean 10% step completes. Default is ~15 min per 10% step (`kDefaultStepUs`), taper-weighted exactly like the measured path, so the provisional figure is in the right ballpark and self-corrects.
+
+### Companion web tool
+
+- `DS5Dongle-OLED-Config-Web` gains **lightbar controls** (mode dropdown + four favorite-color pickers) in the config view, the provisional charge-ETA token in the OLED preview to match this firmware, and translations for two preview notes that were English-only. Build housekeeping: `tsconfig.tsbuildinfo` is no longer tracked.
+
+---
+
+## [0.6.6-oled-edition] — 2026-05-23
+
+Community-issue follow-ups: configurable OLED idle-ladder thresholds (#5) and a diagnostic counter clarifying the trigger-flow numbers (#6). UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.6-oled-edition) (built by `.github/workflows/release.yml`). The companion `DS5Dongle-OLED-Config-Web` config tool gains matching screen-timeout controls and is synced to the v0.6.5+ `Config_body` layout (fixes a latent issue where saving via the old web tool would zero the lightbar fields).
+
+### Added
+
+- **Configurable OLED idle-ladder thresholds (issue #5, requested by @TerryFrench).** The dim and off tiers are no longer hardcoded at 2 / 15 min — two new `Config_body` fields `screen_dim_timeout` / `screen_off_timeout` (minutes, `0 = that tier disabled`, range `[0,250]`) are editable on the Settings screen (`ScrDim`/`ScrOff`) and persist to flash. Defaults preserve the previous 2 / 15 ladder; on upgrade the unset fields read as those defaults via the `config_valid()` clamp. The idle timer moved from `time_us_32()` to 64-bit µs so the full 250-min range is representable without the ~71-min wrap. Power users with always-on dongles can bias shorter; status-watchers can bias longer or set `0` to keep a tier lit.
+- **`trig fold` counter on the Diagnostics screen (issue #6).** Counts trigger-bearing `0x02` host reports that arrived while the speaker stream was active and were therefore folded into the `0x36` audio frames (via `state[]`) instead of sent as a standalone `0x31`. Makes `trig_allow == to_bt(trig) + fold` visible, confirming the apparent `trig`/`tx` gap is audio-path folding, not dropped trigger reports.
+
+---
+
+## [0.6.5-oled-edition] — 2026-05-23
+
+Charging UX (Status-screen battery ETA + amber lightbar pulse), persistent and screen-sticky lightbar control, and a charging-aware idle power ladder. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.5-oled-edition) (built by `.github/workflows/release.yml`).
+
+### Added
+
+- **Charge ETA on the OLED Status screen.** While the DualSense is charging, the battery line shows an estimated time-to-full (`~43m`) to the right of the battery icon. The DS5 only reports battery in 10 % steps over BT (`interrupt_in_data[52]` low nibble, 0–10; high nibble is power-state, 1 = charging), so a smooth countdown is impossible — instead `sample_charge_eta()` times how long each 10 % step takes and extrapolates the remaining steps. It shows `~--m` while calibrating (the first estimate can't appear until one full step has been timed, ~15–20 min after plug-in), then refines on each subsequent notch. The partial step in progress at plug-in is discarded so the first estimate isn't skewed by a half-measured step; a 3-entry moving average smooths the rest. **Li-ion taper correction:** a flat "time-per-step × steps-left" runs optimistic in the constant-voltage tail, so each measured step is normalised to a bulk-equivalent duration (divide out a per-step weight: 1.0× in the bulk region, 1.5× for 80→90 %, 2.2× for 90→100 %) and the remaining steps are re-weighted — keeping the estimate consistent whether the user plugs in near-empty or near-full. Sampled once per frame from `oled_loop` ahead of the idle power-ladder early-returns, so step timing stays correct even while the panel is dimmed/off or the user is on another screen.
+- **Lightbar settings persist across reboot and stick across every screen.** The selected lightbar mode and the four favorite colors are now saved to the config flash sector (new `Config_body` fields `lightbar_mode` + `lb_fav_{r,g,b}[4]`), so a chosen mode/color survives a power cycle. A new **HOST** mode (the default) hands the LED back to the host/game so the dongle doesn't hijack player-indicator LEDs out of the box; on upgrade from ≤0.6.4 the unset field reads as HOST, preserving prior behavior. Mode/favorite edits made on the Lightbar screen are batched into a single flash write when you navigate away (tracked by a dirty flag) to spare flash endurance.
+- **Lightbar pulses amber-orange while charging.** A slow ~4.6 s breathing pulse (base `(255,100,0)`, sine-enveloped from dim to bright via the existing 32-step LUT) shows charging at a glance from any screen. Implemented in the unified `lightbar_service()` (below) as the top-priority owner of the LED, so it overrides the selected mode while charging and reverts to it when unplugged.
+
+### Changed
+
+- **The OLED no longer fully sleeps while the controller is charging.** The idle power ladder is capped at the Dim tier (the low-power breathing dot) instead of advancing to full Off (`cmd(0xAE)`) when `g_charge_eta.charging` is true. The charge-ETA tracker already runs while the panel is off, but users were unplugging the controller to "wake" the dongle — which reset the ETA calibration and restarted the wait-for-the-next-10%-notch. Capping at the dot tier (which draws ~no current) removes the reason to unplug. Normal Active→Dim→Off behavior resumes once charging stops.
+- **A single `lightbar_service()` now owns the controller LED, every frame, on every screen.** Previously the OLED only drove the lightbar via a transient `0x31` packet sent from inside `render_screen_lightbar()` — so the color was only asserted while that screen was open. The service (run from `oled_loop` ahead of the power-ladder early-returns) instead writes the chosen color into the persistent `state[]` block (`SetStateData` `LedRed/Green/Blue`, via new `state_set_led()`), so it rides every outbound host/audio packet, and also actively pushes a `0x31` when audio is idle so animations keep moving. A new `g_lightbar_override` flag gates `state_update()` so the host's `AllowLedColor` writes can't stomp a firmware-chosen mode. During audio the active `0x31` push is suppressed — the `0x36` frames already carry `state[]`'s LED, and slipping a `0x31` between them would intrude on the load-bearing audio path.
+
+### Fixed
+
+- **OLED idle dim/dot tier now actually engages while a controller is connected.** The activity detector hashed `interrupt_in_data[0..9]` with an exact compare, but the analog sticks jitter by ±1 LSB at rest, so the hash changed every few frames and reset the idle timer — meaning the breathing-dot/dim tier only ever kicked in when no controller was paired. Now it mirrors `bt.cpp`'s inactivity heuristic: the stick bytes' rest band `[120,140]` is collapsed to a constant and the volatile counter byte (`idata[6]`) is skipped, so a resting controller reads as idle. Confirmed against a live `/dev/hidraw` capture (only the left-stick X byte was flickering 129↔128).
+- **Lightbar no longer reverts the instant you leave the Lightbar screen.** Root cause: the OLED's `send_lightbar_color()` wrote a one-off `0x31` packet and never touched the persistent `state[]` block, while the host's `0x02` output reports, every audio frame, and reconnect all re-stamp `state[]` (incl. the LED) into the controller. Off the Lightbar screen the OLED stopped pushing, so the next `state[]`-based packet overwrote the color — which is why saved favorites and animated modes (Rainbow/Breathing/Fade) never "stuck." Now that the lightbar is owned through `state[]` with a host override gate (see Changed), the selected mode holds across screens and through active gameplay/audio.
+
+---
+
+## [0.6.4-oled-edition] — 2026-05-19
+
+Trigger-flow diagnostics (in response to issue #3) + the OLED idle power ladder. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.4-oled-edition) (built by `.github/workflows/release.yml`).
+
+### Added
+
+- **OLED idle power ladder.** Replaces the single-tier 5-min auto-dim with a three-stage state machine: at 2 min idle the panel wipes black and a 2×2 "breathing dot" (1 s on / 1 s off) walks through 8 evenly-spaced positions every 30 s; at 15 min idle the SH1107 is sent `cmd(0xAE)` (display off) entirely. Wakes instantly on KEY0/KEY1, controller pair (BT-connect rising edge), or any input-report change. Why this shape: on the Waveshare panel, bench-testing `kDimContrast = 0x10` and `0x02` both produced only ~10 % perceptual reduction (SH1107's contrast register vs apparent brightness is heavily non-linear on this hardware), so the only reliable per-pixel dim available is *rendering fewer pixels*. The breathing dot lights ~4 of 8 192 pixels half the time — roughly a 1 000× drop in cumulative current — while still indicating "the dongle is alive," and the rotating position spreads OLED wear across the panel.
+- **Trigger-flow diagnostic counters on the Diagnostics screen.** `host02` (total `0x02` HID OUT reports from host) / `trig` (those where the host set `AllowRight|LeftTriggerFFB` in `valid_flag0`) / `tx` (forwarded as BT `0x31` sub-`0x10`). Added in response to issue #3 ("trigger tension missing in Death Stranding 2"). Lets the user triage in one game session whether the dongle, the host driver, or the controller is the source of the missing adaptive-trigger effect — without a UART or BT sniffer.
+- **Diagnostics screen now scrolls with the controller D-pad.** Refactored to a row-list (10 rows currently: Uptime / BT state / host02 / trig+tx / BT31 in/s / USB aud/s / BT32 out/s / Mic in/s / Mic dec=&w= / Mic prefix). 5 rows visible at a time; ▲/▼ glyphs at the right edge mark "more above/below." Read-only — no cursor, unlike Settings, since there's nothing to select.
+- **Host-side trigger-flow triage via `scripts/mic_diag.sh bt-trace`.** The firmware's `0xFD` vendor feature report grew a second section (bytes 32–43) with the trigger counters; `bt-trace`'s Python decoder now reads them and prints a one-line verdict — "host driver isn't setting Allow*TriggerFFB" / "trigger Allow bits set but speaker path stole the BT pipe" / "full chain reached the controller". Lets the user diagnose issue #3 without a UART cable or OLED-relay-per-flash.
+- **`README.md` "Diagnostics & debug tooling" section** documents `scripts/mic_diag.sh` and its subcommands. The script existed but was only mentioned inside `BLUETOOTH_AUDIO_NOTES.md` — invisible to anyone who hadn't already read the parked-mic notes.
+
+### Changed
+
+- **`flush_fb()` split.** Internal refactor: `flush_fb_raw()` writes just the framebuffer; `flush_fb()` is now `draw_button_chrome() + flush_fb_raw()`. Lets the dim-tier renderer push the breathing dot without the K0/K1 chrome arrows (no navigation target while the panel is asleep).
+- **Diagnostics row order re-prioritized.** The first 5 rows (always visible without scrolling) cover the most common triage path: Uptime / BT state / `host02` / `trig`+`tx` / `BT31 in/s`. Audio + parked-mic-investigation counters live below the fold.
+
+---
+
 ## [0.6.3-oled-edition] — 2026-05-18
 
 Small follow-up to v0.6.2. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.3-oled-edition) (built by `.github/workflows/release.yml`).

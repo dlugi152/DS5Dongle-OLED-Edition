@@ -4,6 +4,7 @@
 #include "slots.h"
 #include "audio.h"
 #include "config.h"
+#include "state_mgr.h"
 
 #include <cstdio>
 #include <cstring>
@@ -16,6 +17,24 @@
 #include "pico/time.h"
 
 extern uint8_t interrupt_in_data[63]; // defined in main.cpp
+
+// Mic diagnostic counters (defined in main.cpp).
+extern uint32_t bt_31_packet_count();
+extern uint32_t host_out02_total();
+extern uint32_t host_out02_trig_allow();
+extern uint32_t host_out02_to_bt();
+extern uint32_t host_out02_trig_folded();
+extern uint8_t  bt_31_last_byte2();
+extern uint8_t  bt_31_b2_or_mask();
+extern uint16_t bt_31_len_min();
+extern uint16_t bt_31_len_max();
+extern void     bt_31_mic_prefix(uint8_t out[6]);
+extern bool     spk_active; // main.cpp: true while host USB speaker stream is open
+
+// Global (not in the anon namespace below) so state_mgr.cpp can extern it:
+// true while an OLED lightbar mode or the charging pulse owns the LED, which
+// tells state_update() to ignore the host's AllowLedColor writes.
+bool g_lightbar_override = false;
 
 namespace {
 
@@ -63,11 +82,24 @@ constexpr int kNumBrightLevels = sizeof(kBrightLevels) / sizeof(kBrightLevels[0]
 int bright_idx = 0;
 uint8_t current_contrast = 0xFF;
 
-// Auto-dim after idle. Tracks last button/input activity.
-uint32_t last_activity_us = 0;
+// Auto-dim / auto-off after idle. Tracks last button/input activity.
+// Tier 1: Active → full brightness (bright_idx).
+// Tier 2: idle > dim threshold → contrast drops to kDimContrast (deep dim).
+// Tier 3: idle > off threshold → SH1107 panel turned fully off (cmd 0xAE)
+//         to prevent OLED burn-in on long unattended sits.
+// The two thresholds are user-configurable (Config_body.screen_dim_timeout /
+// screen_off_timeout, minutes; 0 = tier disabled) — issue #5. last_activity_us
+// is 64-bit µs so the full 0..250 min range is representable without the ~71 min
+// wrap of time_us_32().
+// kDimContrast tuned by eye: 0x10 looked like only ~10% reduction on this
+// panel (contrast-vs-brightness is heavily non-linear near the bottom of
+// the register range). 0x02 is visibly dim while still legible up close.
+uint64_t last_activity_us = 0;
 uint32_t last_input_hash = 0;
-constexpr uint32_t kAutoDimUs = 5UL * 60UL * 1000000UL; // 5 min
-constexpr uint8_t kDimContrast = 0x10;
+constexpr uint8_t kDimContrast = 0x01;
+enum OledPowerState { OLED_ACTIVE, OLED_DIM, OLED_OFF };
+OledPowerState oled_power_state = OLED_ACTIVE;
+bool prev_bt_connected = false;
 
 // Screen ordering — single source of truth. Reorder by editing this block;
 // oled_loop's switch and handle_buttons' KEY1 contextual checks use these
@@ -86,16 +118,23 @@ constexpr int kScreenSettings  = 10;
 constexpr int kNumScreens      = 11;
 int current_screen = 0;
 
-// Lightbar mode cycle: 0=LIVE, 1-4=FAV0-3, 5=BREATHING, 6=RAINBOW, 7=FADE
-constexpr int kNumLbModes = 8;
+// Lightbar mode cycle: 0=LIVE, 1-4=FAV0-3, 5=BREATHING, 6=RAINBOW, 7=FADE,
+// 8=HOST (passthrough — let the host/game own the LED). HOST is the default so
+// the dongle doesn't hijack game player-indicator LEDs out of the box. Keep
+// this numbering in sync with Config_body::lightbar_mode (src/config.h).
+constexpr int kLbModeHost = 8;
+constexpr int kNumLbModes = 9;
 
 // Settings screen state
-constexpr int kNumSettingsItems = 13; // 8 fields + 3 auto-haptic + Reset + Wipe
+constexpr int kNumSettingsItems = 16; // 8 fields + 3 auto-haptic + 2 screen-timeout + BT mic + Reset + Wipe
 constexpr int kSettingsAutoHapEnaIdx  = 8;
 constexpr int kSettingsAutoHapGainIdx = 9;
 constexpr int kSettingsAutoHapLpIdx   = 10;
-constexpr int kSettingsResetIdx       = 11;
-constexpr int kSettingsWipeSlotsIdx   = 12;
+constexpr int kSettingsScrDimIdx      = 11;
+constexpr int kSettingsScrOffIdx      = 12;
+constexpr int kSettingsBtMicIdx       = 13;
+constexpr int kSettingsResetIdx       = 14;
+constexpr int kSettingsWipeSlotsIdx   = 15;
 Config_body settings_local{};
 int settings_sel = 0;
 bool settings_dirty = false;
@@ -112,12 +151,16 @@ constexpr uint32_t kResetHoldUs = 2000000;
 
 uint8_t lb_r = 0, lb_g = 0, lb_b = 0;
 
-// Lightbar mode + favorite slots: 0 = LIVE tilt preview; 1..4 = saved slots F0..F3
-int lb_mode = 0;
+// Lightbar mode + favorite slots: 0 = LIVE tilt preview; 1..4 = saved slots F0..F3.
+// These are seeded from flash (lightbar_load_config) at boot; the defaults here
+// only apply before that runs. lb_dirty tracks an unsaved mode/favorite change
+// so we persist once on leaving the Lightbar screen instead of per button press.
+int lb_mode = kLbModeHost;
 uint8_t lb_fav_r[4] = {255, 0,   0,   255}; // Red, Green, Blue, White defaults
 uint8_t lb_fav_g[4] = {0,   255, 0,   255};
 uint8_t lb_fav_b[4] = {0,   0,   255, 255};
 uint8_t lb_last_face = 0;
+bool lb_dirty = false;
 
 uint32_t rumble_off_at_us = 0;
 bool rumble_active = false;
@@ -193,8 +236,7 @@ void sh1107_init() {
 // lives near the other text-drawing helpers below.
 void draw_button_chrome();
 
-void flush_fb() {
-    draw_button_chrome();
+void flush_fb_raw() {
     cmd(0xB0);
     for (int j = 0; j < kH; j++) {
         const uint8_t col = kH - 1 - j;
@@ -204,6 +246,11 @@ void flush_fb() {
             data_byte(reverse_byte(fb[j * kRowBytes + i]));
         }
     }
+}
+
+void flush_fb() {
+    draw_button_chrome();
+    flush_fb_raw();
 }
 
 void fb_clear() { memset(fb, 0, sizeof(fb)); }
@@ -224,6 +271,16 @@ void rect_filled(int x, int y, int w, int h) {
     for (int j = 0; j < h; j++)
         for (int i = 0; i < w; i++)
             px(x + i, y + j, true);
+}
+
+// XOR-invert every pixel in a region (used to flash a control "pressed").
+void rect_invert(int x, int y, int w, int h) {
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            const int xx = x + i, yy = y + j;
+            if (xx < 0 || xx >= kW || yy < 0 || yy >= kH) continue;
+            fb[yy * kRowBytes + (xx / 8)] ^= 1 << (7 - (xx % 8));
+        }
 }
 
 void draw_char(int x, int y, char c) {
@@ -438,13 +495,13 @@ void handle_buttons() {
     if (!k0 && key0_prev && (now - key0_t_us) > kDebounceUs) {
         key0_t_us = now;
         key0_armed = true;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
     if (k0 && !key0_prev && key0_armed) {
         key0_armed = false;
         current_screen = (current_screen + 1) % kNumScreens;
         last_render_us = 0;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
 
     // KEY1: arm on press, fire on release. Short press = back; long press
@@ -456,12 +513,12 @@ void handle_buttons() {
         key1_t_us = now;
         key1_press_us = now;
         key1_was_pressed = true;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
     if (k1 && !key1_prev && key1_was_pressed) {
         key1_was_pressed = false;
         const uint32_t held = now - key1_press_us;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
         if (held > kLongPressUs) {
             bright_idx = (bright_idx + 1) % kNumBrightLevels;
         } else {
@@ -472,6 +529,147 @@ void handle_buttons() {
 
     key0_prev = k0;
     key1_prev = k1;
+}
+
+// --- Charge ETA tracker --------------------------------------------------
+// The DS5 only reports battery in 10% steps (interrupt_in_data[52] low
+// nibble, 0..10; high nibble is power-state, 1 == charging). We can't read a
+// finer percentage over BT, so a smooth countdown is impossible. Instead we
+// time how long each 10% step takes while charging and extrapolate the
+// remaining steps. Sampled once per frame from oled_loop (continuously, so
+// the estimate stays current even while the panel is dimmed/off and even when
+// the user is on another screen); render_screen reads g_charge_eta.
+//
+// Taper correction: Li-ion CC/CV charging slows sharply near the top, so a
+// flat "time per step × steps left" runs optimistic in the last ~20%. Each
+// measured step is normalised to a bulk-equivalent duration (divide out the
+// step's taper weight); the remaining steps are then re-weighted. This makes
+// the estimate consistent whether the user plugged in near-empty or near-full.
+struct ChargeEta {
+    bool charging;    // pstate == 1 (so the token shows only while charging)
+    bool valid;       // minutes is meaningful (provisional or measured)
+    bool provisional; // true until a full step is timed — using the default rate
+    int  minutes;     // estimated minutes to 100%
+};
+ChargeEta g_charge_eta{};
+
+// Default bulk-step duration used for a provisional estimate before any real
+// step has been timed, so the token shows "~Nm?" immediately on plug-in instead
+// of sitting on "~--m" for ~15-20 min. Tuned to an observed ~15 min per 10% on
+// this dongle's charge current; it self-corrects to the measured rate (and drops
+// the "?") as soon as the first clean step completes.
+constexpr float kDefaultStepUs = 15.0f * 60.0f * 1000000.0f;
+
+// Ceiling on a single timed step's bulk-equivalent duration. A genuine idle 10%
+// step on this dongle is ~15 min; anything past ~30 min is almost always an
+// anomalous/under-load sample (e.g. the controller in use while charging, or a
+// battery-nibble bounce) that would otherwise balloon the projection — observed
+// reading ~222m at 70% off one ~47-min step. We clamp such samples instead of
+// trusting them, and pair that with a median over kRing steps so one bad reading
+// can't dominate the estimate.
+constexpr float kMaxStepUs = 30.0f * 60.0f * 1000000.0f;
+
+// Relative time the step *ending* at `to_level` (10% units, 1..10) takes vs a
+// bulk step. Tuned to the Li-ion CV taper: ~80% onward stretches out.
+static float charge_step_weight(int to_level) {
+    if (to_level >= 10) return 2.2f;  // 90→100% (constant-voltage tail)
+    if (to_level == 9)  return 1.5f;  // 80→90%  (taper begins)
+    return 1.0f;                      // bulk constant-current region
+}
+
+void sample_charge_eta() {
+    constexpr int kRing = 5;                 // median over the last few steps
+    static float    ring[kRing] = {0};       // bulk-equivalent step durations (us)
+    static int      ring_count = 0;
+    static int      ring_head = 0;
+    static int      cur_step = -1;           // last observed 10% step
+    static uint64_t step_start_us = 0;
+    static bool     was_charging = false;
+    static bool     first_step_pending = false;  // discard the partial step at plug-in
+
+    const uint8_t pwr   = interrupt_in_data[52];
+    int           step  = pwr & 0x0F;
+    if (step > 10) step = 10;
+    const uint8_t pstate = pwr >> 4;
+    const bool charging = bt_is_connected() && (pstate == 1);
+
+    if (!charging) {
+        g_charge_eta = ChargeEta{};          // clears charging/valid/minutes
+        ring_count = ring_head = 0;
+        cur_step = -1;
+        was_charging = false;
+        return;
+    }
+
+    const uint64_t now = time_us_64();
+    if (!was_charging) {
+        // Just plugged in: start timing from here. The step in progress is
+        // partial, so its duration gets discarded when it completes.
+        cur_step = step;
+        step_start_us = now;
+        ring_count = ring_head = 0;
+        first_step_pending = true;
+        was_charging = true;
+    } else if (step == cur_step + 1) {
+        // One clean step completed. Skip the first (partial) one; otherwise
+        // record its bulk-equivalent duration.
+        const float dur = (float)(now - step_start_us);
+        if (first_step_pending) {
+            first_step_pending = false;
+        } else {
+            float be = dur / charge_step_weight(step);
+            if (be > kMaxStepUs) be = kMaxStepUs;   // clamp under-load/anomalous outliers
+            ring[ring_head] = be;
+            ring_head = (ring_head + 1) % kRing;
+            if (ring_count < kRing) ring_count++;
+        }
+        cur_step = step;
+        step_start_us = now;
+    } else if (step != cur_step) {
+        // Multi-step jump (e.g. woke from sleep across several steps) or a
+        // small dip under heavy use — can't attribute timing cleanly, so just
+        // resync without polluting the ring.
+        cur_step = step;
+        step_start_us = now;
+        first_step_pending = false;
+    }
+
+    g_charge_eta.charging = true;
+    if (cur_step < 10) {
+        // Use the measured rate once we have a timed step; until then fall back
+        // to the default rate and flag the estimate provisional (renders "?").
+        const bool measured = (ring_count > 0);
+        float bulk;
+        if (measured) {
+            // Median of the timed steps — robust to a single slow/fast outlier
+            // in a way the old mean wasn't (one 47-min under-load step used to
+            // drag the whole projection up). kRing is tiny, so insertion-sort.
+            float tmp[kRing];
+            for (int i = 0; i < ring_count; i++) tmp[i] = ring[i];
+            for (int i = 1; i < ring_count; i++) {
+                const float v = tmp[i];
+                int j = i - 1;
+                while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; }
+                tmp[j + 1] = v;
+            }
+            bulk = tmp[ring_count / 2];
+        } else {
+            bulk = kDefaultStepUs;
+        }
+        float rem_us = 0.0f;
+        for (int L = cur_step + 1; L <= 10; L++) rem_us += bulk * charge_step_weight(L);
+        int mins = (int)(rem_us / 60000000.0f + 0.5f);
+        if (mins < 0)   mins = 0;
+        if (mins > 999) mins = 999;
+        g_charge_eta.valid = true;
+        g_charge_eta.provisional = !measured;
+        g_charge_eta.minutes = mins;
+    } else {
+        // cur_step == 10 → essentially full; nothing meaningful to count down.
+        g_charge_eta.valid = true;
+        g_charge_eta.provisional = false;
+        g_charge_eta.minutes = 0;
+    }
 }
 
 __attribute__((noinline)) void render_screen() {
@@ -506,17 +704,35 @@ __attribute__((noinline)) void render_screen() {
         draw_text(kContentX, 18, bbuf);
         draw_battery_icon(36, 18, pct);
 
+        // Charge ETA, right of the battery icon (icon ends at x≈90). Shown only
+        // while charging: "~43m?" is the provisional default-rate estimate shown
+        // immediately on plug-in; the "?" drops to "~43m" once a real 10% step
+        // has been timed and the measured rate takes over. See sample_charge_eta().
+        if (g_charge_eta.charging) {
+            char ebuf[8];
+            if (g_charge_eta.valid)
+                snprintf(ebuf, sizeof(ebuf), "~%dm%s", g_charge_eta.minutes,
+                         g_charge_eta.provisional ? "?" : "");
+            else
+                snprintf(ebuf, sizeof(ebuf), "~--m");
+            draw_text(94, 18, ebuf);
+        }
+
         // Left-half visuals are shifted right by kContentX so the < button
         // chrome at (x=0, y=49) doesn't paint over the live stick dot.
         rect_outline(kContentX, 30, 32, 32);
         int lx = (kContentX + 2) + (interrupt_in_data[0] * 27) / 255;
         int ly = 32 + (interrupt_in_data[1] * 27) / 255;
         rect_filled(lx - 1, ly - 1, 3, 3);
+        // L3 (left stick click) — invert the whole box as a pressed indicator.
+        if (interrupt_in_data[8] & 0x40) rect_invert(kContentX, 30, 32, 32);
 
         rect_outline(96, 30, 32, 32);
         int rx = 98 + (interrupt_in_data[2] * 27) / 255;
         int ry = 32 + (interrupt_in_data[3] * 27) / 255;
         rect_filled(rx - 1, ry - 1, 3, 3);
+        // R3 (right stick click) — invert the whole box.
+        if (interrupt_in_data[8] & 0x80) rect_invert(96, 30, 32, 32);
 
         // L2/R2 analog trigger bars (vertical, fill from bottom). L2 sits
         // just right of the shifted left stick box.
@@ -604,46 +820,138 @@ __attribute__((noinline)) void render_screen_rssi() {
     flush_fb();
 }
 
-__attribute__((noinline)) void render_screen_diag() {
-    fb_clear();
+// Diagnostics screen state. Read-only viewport that scrolls with controller
+// D-pad up/down. No cursor — there's nothing to select.
+int   diag_scroll = 0;
+uint8_t diag_last_dpad = 8; // edge-trigger N/E/S/W like settings_handle_input
 
-    draw_text(kContentX, 0, "Diagnostics");
+// Per-second rates sampled once per render, shared across format_diag_row's
+// rate-based rows so they stay in sync.
+struct DiagRates {
+    uint32_t usb_rate;
+    uint32_t bt_rate;
+    uint32_t mic_rate;
+    uint32_t bt31_rate;
+};
+DiagRates g_diag_rates{};
 
-    const uint32_t uptime_s = time_us_32() / 1000000u;
-    const uint32_t h = uptime_s / 3600u;
-    const uint32_t m = (uptime_s / 60u) % 60u;
-    const uint32_t s = uptime_s % 60u;
-    char buf[24];
-    snprintf(buf, sizeof(buf), "Up:%luh %02lum %02lus", (unsigned long)h, (unsigned long)m, (unsigned long)s);
-    draw_text(kContentX, 9, buf);
-
-    // Per-second rates for the audio path counters — recompute every render.
-    static uint32_t prev_us_frames = 0, prev_bt_packets = 0;
+void sample_diag_rates() {
+    static uint32_t prev_us_frames = 0, prev_bt_packets = 0, prev_mic_frames = 0, prev_bt31 = 0;
     static uint32_t prev_sample_us = 0;
     const uint32_t now_us = time_us_32();
-    const uint32_t cur_us_frames = audio_usb_frames();
+    const uint32_t cur_us_frames  = audio_usb_frames();
     const uint32_t cur_bt_packets = audio_bt_packets();
-    uint32_t usb_rate = 0, bt_rate = 0;
+    const uint32_t cur_mic_frames = audio_mic_frames();
+    const uint32_t cur_bt31       = bt_31_packet_count();
     if (prev_sample_us != 0 && now_us > prev_sample_us) {
         const uint32_t dt_us = now_us - prev_sample_us;
         if (dt_us > 0) {
-            usb_rate = (uint32_t)(((uint64_t)(cur_us_frames - prev_us_frames) * 1000000u) / dt_us);
-            bt_rate  = (uint32_t)(((uint64_t)(cur_bt_packets - prev_bt_packets) * 1000000u) / dt_us);
+            g_diag_rates.usb_rate  = (uint32_t)(((uint64_t)(cur_us_frames  - prev_us_frames)  * 1000000u) / dt_us);
+            g_diag_rates.bt_rate   = (uint32_t)(((uint64_t)(cur_bt_packets - prev_bt_packets) * 1000000u) / dt_us);
+            g_diag_rates.mic_rate  = (uint32_t)(((uint64_t)(cur_mic_frames - prev_mic_frames) * 1000000u) / dt_us);
+            g_diag_rates.bt31_rate = (uint32_t)(((uint64_t)(cur_bt31       - prev_bt31)       * 1000000u) / dt_us);
         }
     }
-    prev_us_frames = cur_us_frames;
+    prev_us_frames  = cur_us_frames;
     prev_bt_packets = cur_bt_packets;
-    prev_sample_us = now_us;
+    prev_mic_frames = cur_mic_frames;
+    prev_bt31       = cur_bt31;
+    prev_sample_us  = now_us;
+}
 
-    snprintf(buf, sizeof(buf), "USB aud %lu/s", (unsigned long)usb_rate);
-    draw_text(kContentX, 18, buf);
-    snprintf(buf, sizeof(buf), "BT 0x32 %lu/s", (unsigned long)bt_rate);
-    draw_text(kContentX, 27, buf);
-    snprintf(buf, sizeof(buf), "HCI errs:  %lu", (unsigned long)bt_hci_err_count());
-    draw_text(kContentX, 36, buf);
+// Row list ordered by relevance: always-useful at top, parked-mic-investigation
+// data at bottom. To add a row, bump kNumDiagRows and add a case.
+constexpr int kNumDiagRows = 12;
+__attribute__((noinline))
+void format_diag_row(int idx, char* line, size_t n) {
+    switch (idx) {
+        case 0: {
+            const uint32_t s = time_us_32() / 1000000u;
+            snprintf(line, n, "Up:%luh %02lum %02lus",
+                     (unsigned long)(s / 3600u),
+                     (unsigned long)((s / 60u) % 60u),
+                     (unsigned long)(s % 60u));
+            break;
+        }
+        case 1:
+            snprintf(line, n, "BT: %s", bt_is_connected() ? "connected" : "waiting");
+            break;
+        case 2:
+            snprintf(line, n, "host02: %lu", (unsigned long)host_out02_total());
+            break;
+        case 3:
+            snprintf(line, n, "trig %lu / tx %lu",
+                     (unsigned long)host_out02_trig_allow(),
+                     (unsigned long)host_out02_to_bt());
+            break;
+        case 4:
+            // Trigger reports folded into the 0x36 audio path (speaker active),
+            // not sent as 0x31. trig == tx-trig-share + this → no drops (#6).
+            snprintf(line, n, "trig fold: %lu", (unsigned long)host_out02_trig_folded());
+            break;
+        case 5:
+            snprintf(line, n, "BT31 in: %lu/s", (unsigned long)g_diag_rates.bt31_rate);
+            break;
+        case 6:
+            snprintf(line, n, "USB aud: %lu/s", (unsigned long)g_diag_rates.usb_rate);
+            break;
+        case 7:
+            snprintf(line, n, "BT32 out: %lu/s", (unsigned long)g_diag_rates.bt_rate);
+            break;
+        case 8:
+            snprintf(line, n, "Mic in: %lu/s", (unsigned long)g_diag_rates.mic_rate);
+            break;
+        case 9:
+            snprintf(line, n, "Mic dec=%ld w=%u",
+                     (long)audio_mic_last_decoded(),
+                     (unsigned)audio_mic_last_wrote());
+            break;
+        case 10:
+            snprintf(line, n, "Mic PLC: %lu", (unsigned long)audio_mic_plc_frames());
+            break;
+        case 11: {
+            uint8_t pfx[6]; bt_31_mic_prefix(pfx);
+            snprintf(line, n, "%02X %02X %02X %02X %02X %02X",
+                     pfx[0], pfx[1], pfx[2], pfx[3], pfx[4], pfx[5]);
+            break;
+        }
+        default:
+            line[0] = '\0';
+            break;
+    }
+}
 
-    snprintf(buf, sizeof(buf), "BT: %s", bt_is_connected() ? "connected" : "waiting");
-    draw_text(kContentX, 45, buf);
+void diag_handle_input(int visible) {
+    if (!bt_is_connected()) return;
+    const uint8_t dpad = (uint8_t)(interrupt_in_data[7] & 0x0F);
+    if (dpad != diag_last_dpad && dpad != 8) {
+        if      (dpad == 0) diag_scroll--; // up
+        else if (dpad == 4) diag_scroll++; // down
+    }
+    diag_last_dpad = dpad;
+    const int max_top = (kNumDiagRows > visible) ? (kNumDiagRows - visible) : 0;
+    if (diag_scroll < 0) diag_scroll = 0;
+    if (diag_scroll > max_top) diag_scroll = max_top;
+}
+
+__attribute__((noinline)) void render_screen_diag() {
+    fb_clear();
+    draw_text(kContentX, 0, "Diagnostics");
+
+    sample_diag_rates();
+    constexpr int kVisible = 5;
+    diag_handle_input(kVisible);
+
+    char line[28];
+    for (int i = 0; i < kVisible && diag_scroll + i < kNumDiagRows; i++) {
+        format_diag_row(diag_scroll + i, line, sizeof(line));
+        draw_text(kContentX, 9 + i * 9, line);
+    }
+
+    // Scroll indicators along the right edge, adjacent to the visible content
+    // rather than in a footer — keeps the bottom row available for content.
+    if (diag_scroll > 0)                       draw_text(120, 9,  "^");
+    if (diag_scroll + kVisible < kNumDiagRows) draw_text(120, 45, "v");
 
     flush_fb();
 }
@@ -745,6 +1053,85 @@ __attribute__((noinline)) void render_screen_triggers() {
     flush_fb();
 }
 
+// --- IMU calibration (DS5 feature report 0x05) ---------------------------
+// The DualSense ships per-unit gyro/accel calibration in feature report 0x05,
+// which bt.cpp already fetches and caches at connect (init_feature). Parsing it
+// lets the Gyro Tilt screen and the tilt->RGB lightbar mode use bias- and
+// sensitivity-corrected accel instead of raw counts, so the tilt dot recenters
+// per controller. Parse + apply mirror SDL's SDL_hidapi_ps5.c (zlib-licensed)
+// LoadCalibrationData/ApplyCalibrationData (credit); feature_data[0x05]'s byte
+// layout matches SDL's data[] (index 0 = report id, calibration words from 1).
+//
+// imu_apply keeps accel in the same +-8192 == 1g count space the callers already
+// scale by, so existing /8192 (gyro screen) and +-8192 (lightbar) math is
+// unchanged — calibration only removes the per-axis zero offset and corrects gain.
+struct ImuCal { int16_t bias; float sens; };  // 0..2 gyro P/Y/R, 3..5 accel X/Y/Z
+ImuCal g_imu_cal[6];
+bool   g_imu_cal_valid = false;   // a plausible calibration was loaded
+bool   g_imu_cal_tried = false;   // 0x05 has been seen this connection (good or bad)
+
+constexpr float kGyroResPerDeg = 1024.0f;
+constexpr float kAccelResPerG  = 8192.0f;
+
+inline int16_t cal_ld16(const std::vector<uint8_t>& d, int i) {
+    return (int16_t)((uint16_t)d[i] | ((uint16_t)d[i + 1] << 8));
+}
+
+__attribute__((noinline))
+void imu_cal_parse(const std::vector<uint8_t>& d) {
+    g_imu_cal_valid = false;
+    if (d.size() < 35) return;                 // SDL requires >= 35 calibration bytes
+
+    const int16_t gPB = cal_ld16(d, 1),  gYB = cal_ld16(d, 3),  gRB = cal_ld16(d, 5);
+    const int16_t gPp = cal_ld16(d, 7),  gPm = cal_ld16(d, 9);
+    const int16_t gYp = cal_ld16(d, 11), gYm = cal_ld16(d, 13);
+    const int16_t gRp = cal_ld16(d, 15), gRm = cal_ld16(d, 17);
+    const int16_t gSp = cal_ld16(d, 19), gSm = cal_ld16(d, 21);
+    const int16_t aXp = cal_ld16(d, 23), aXm = cal_ld16(d, 25);
+    const int16_t aYp = cal_ld16(d, 27), aYm = cal_ld16(d, 29);
+    const int16_t aZp = cal_ld16(d, 31), aZm = cal_ld16(d, 33);
+
+    const float num = (float)(gSp + gSm) * kGyroResPerDeg;
+    g_imu_cal[0] = { gPB, num / (float)(gPp - gPm) };
+    g_imu_cal[1] = { gYB, num / (float)(gYp - gYm) };
+    g_imu_cal[2] = { gRB, num / (float)(gRp - gRm) };
+
+    int16_t r;
+    r = aXp - aXm; g_imu_cal[3] = { (int16_t)(aXp - r / 2), 2.0f * kAccelResPerG / (float)r };
+    r = aYp - aYm; g_imu_cal[4] = { (int16_t)(aYp - r / 2), 2.0f * kAccelResPerG / (float)r };
+    r = aZp - aZm; g_imu_cal[5] = { (int16_t)(aZp - r / 2), 2.0f * kAccelResPerG / (float)r };
+
+    // Sanity gate (same as SDL): a wild bias or a gain off by >50% means a bad
+    // factory cal or a short/garbled read — fall back to raw rather than amplify it.
+    for (int i = 0; i < 6; i++) {
+        const float divisor = (i < 3) ? 64.0f : 1.0f;
+        const int   ab      = g_imu_cal[i].bias < 0 ? -g_imu_cal[i].bias : g_imu_cal[i].bias;
+        float       gain    = 1.0f - g_imu_cal[i].sens / divisor;
+        if (gain < 0) gain = -gain;
+        if (ab > 1024 || gain > 0.5f) return;  // leave g_imu_cal_valid = false
+    }
+    g_imu_cal_valid = true;
+}
+
+// Poll once per frame from oled_loop: parse 0x05 the first time it is available
+// for this controller, and reset on disconnect so the next controller re-reads.
+void imu_cal_service() {
+    if (!bt_is_connected()) { g_imu_cal_valid = false; g_imu_cal_tried = false; return; }
+    if (g_imu_cal_tried) return;
+    auto d = bt_peek_feature(0x05);
+    if (d.size() < 35) return;                 // not arrived yet — retry next frame
+    imu_cal_parse(d);
+    g_imu_cal_tried = true;
+}
+
+// index 0..2 gyro, 3..5 accel. Returns the calibrated value in the same count
+// scale the raw value used (+-8192 == 1g for accel); identity when no valid
+// calibration is loaded, so behaviour matches the pre-calibration firmware.
+inline int16_t imu_apply(int index, int16_t raw) {
+    if (!g_imu_cal_valid) return raw;
+    return (int16_t)((float)(raw - g_imu_cal[index].bias) * g_imu_cal[index].sens);
+}
+
 __attribute__((noinline)) void render_screen_gyro() {
     fb_clear();
     draw_text(kContentX, 0, "Gyro Tilt");
@@ -753,6 +1140,9 @@ __attribute__((noinline)) void render_screen_gyro() {
         memcpy(&ax, &interrupt_in_data[21], 2);
         memcpy(&ay, &interrupt_in_data[23], 2);
         memcpy(&az, &interrupt_in_data[25], 2);
+        ax = imu_apply(3, ax);  // bias/sensitivity-corrected accel (identity if no cal)
+        ay = imu_apply(4, ay);
+        az = imu_apply(5, az);
         char buf[16];
         snprintf(buf, sizeof(buf), "X%+5d", ax); draw_text(kContentX, 10, buf);
         snprintf(buf, sizeof(buf), "Y%+5d", ay); draw_text(50, 10, buf);
@@ -762,8 +1152,15 @@ __attribute__((noinline)) void render_screen_gyro() {
         rect_outline(bx, by, bw, bh);
         for (int x = bx + 1; x < bx + bw - 1; x++) px(x, by + bh / 2, true);
         for (int y = by + 1; y < by + bh - 1; y++) px(bx + bw / 2, y, true);
-        int dx = ((int)ax * (bw / 2 - 3)) / 8192;
-        int dy = ((int)ay * (bh / 2 - 3)) / 8192;
+        // Plot the two axes that read ~0 when the controller lies flat: X (roll,
+        // left/right) and Z (pitch, fwd/back). Gravity rests on Y when flat, so
+        // driving the dot from Y pegged it to the bottom edge at rest — using Z
+        // keeps the dot centred flat and it tracks as you tilt. (Readout above
+        // still shows all three raw axes.)
+        // Negated so the dot follows the tilt direction: tilt left -> dot left,
+        // tilt forward -> dot up (gravity pulls the opposite way on the axis).
+        int dx = -((int)ax * (bw / 2 - 3)) / 8192;
+        int dy = -((int)az * (bh / 2 - 3)) / 8192;
         int cx = bx + bw / 2 + dx;
         int cy = by + bh / 2 + dy;
         if (cx < bx + 2) cx = bx + 2;
@@ -856,6 +1253,7 @@ const char* lb_mode_tag(int mode) {
         case 5: return "[BREA]";
         case 6: return "[RAIN]";
         case 7: return "[FADE]";
+        case 8: return "[HOST]";
         default: return "[????]";
     }
 }
@@ -871,6 +1269,7 @@ void lightbar_handle_input() {
     const bool r1_prev   = (lb_last_buttons & 0x02) != 0;
     if (r1_now && !r1_prev) {
         lb_mode = (lb_mode + 1) % kNumLbModes;
+        lb_dirty = true; // persisted on leaving the Lightbar screen
     }
     lb_last_buttons = btns;
 }
@@ -882,49 +1281,8 @@ __attribute__((noinline)) void render_screen_lightbar() {
     draw_text(86, 0, lb_mode_tag(lb_mode));
 
     if (bt_is_connected()) {
-        const uint32_t now_ms = time_us_32() / 1000;
-        if (lb_mode == 0) {
-            // LIVE: tilt -> RGB
-            int16_t ax, ay, az;
-            memcpy(&ax, &interrupt_in_data[21], 2);
-            memcpy(&ay, &interrupt_in_data[23], 2);
-            memcpy(&az, &interrupt_in_data[25], 2);
-            const int rr = ((int)ax + 8192) * 255 / 16384;
-            const int gg = ((int)ay + 8192) * 255 / 16384;
-            const int bb = ((int)az + 8192) * 255 / 16384;
-            lb_r = (uint8_t)(rr < 0 ? 0 : rr > 255 ? 255 : rr);
-            lb_g = (uint8_t)(gg < 0 ? 0 : gg > 255 ? 255 : gg);
-            lb_b = (uint8_t)(bb < 0 ? 0 : bb > 255 ? 255 : bb);
-        } else if (lb_mode <= 4) {
-            // FAV slot: fixed color
-            const int slot = lb_mode - 1;
-            lb_r = lb_fav_r[slot];
-            lb_g = lb_fav_g[slot];
-            lb_b = lb_fav_b[slot];
-        } else if (lb_mode == 5) {
-            // BREATHING: modulate FAV0 brightness with a sine wave (~3 s cycle)
-            const uint8_t phase = (uint8_t)(now_ms / 12);
-            const int s = sin_lut(phase); // -127..127
-            const uint16_t scale = (uint16_t)(32 + (s + 127) / 2); // 32..191
-            lb_r = (uint8_t)((lb_fav_r[0] * scale) / 255);
-            lb_g = (uint8_t)((lb_fav_g[0] * scale) / 255);
-            lb_b = (uint8_t)((lb_fav_b[0] * scale) / 255);
-        } else if (lb_mode == 6) {
-            // RAINBOW: hue sweep over ~6 s
-            const uint16_t hue = (uint16_t)((now_ms / 17) % 360);
-            hsv_to_rgb(hue, 255, 255, &lb_r, &lb_g, &lb_b);
-        } else {
-            // FADE between FAV slots, 2 s per slot
-            const uint32_t kSlotMs = 2000;
-            const uint32_t total = now_ms % (4 * kSlotMs);
-            const int slot = (int)(total / kSlotMs);
-            const int next = (slot + 1) & 3;
-            const uint16_t blend = (uint16_t)(((total - slot * kSlotMs) * 256u) / kSlotMs);
-            lb_r = (uint8_t)((lb_fav_r[slot] * (255 - blend) + lb_fav_r[next] * blend) / 255);
-            lb_g = (uint8_t)((lb_fav_g[slot] * (255 - blend) + lb_fav_g[next] * blend) / 255);
-            lb_b = (uint8_t)((lb_fav_b[slot] * (255 - blend) + lb_fav_b[next] * blend) / 255);
-        }
-
+        // lb_r/lb_g/lb_b are computed every frame by lightbar_service() (which
+        // runs ahead of this render in oled_loop), so here we only display them.
         char buf[16];
         snprintf(buf, sizeof(buf), "R:%3u", lb_r); draw_text(kContentX, 12, buf);
         snprintf(buf, sizeof(buf), "G:%3u", lb_g); draw_text(48, 12, buf);
@@ -948,23 +1306,146 @@ __attribute__((noinline)) void render_screen_lightbar() {
             lb_fav_r[save_slot] = lb_r;
             lb_fav_g[save_slot] = lb_g;
             lb_fav_b[save_slot] = lb_b;
+            lb_dirty = true; // persisted on leaving the Lightbar screen
         }
 
         draw_text(kContentX, 38, "Sv:T=0 C=1 X=2 S=3");
         const char* hint =
-            (lb_mode == 0) ? "Tilt = R/G/B" :
-            (lb_mode == 5) ? "Breathing FAV0" :
-            (lb_mode == 6) ? "Rainbow sweep" :
-            (lb_mode == 7) ? "Fade thru FAVs" :
-                             "Locked to fav";
+            (lb_mode == 0)           ? "Tilt = R/G/B"   :
+            (lb_mode == 5)           ? "Breathing FAV0" :
+            (lb_mode == 6)           ? "Rainbow sweep"  :
+            (lb_mode == 7)           ? "Fade thru FAVs" :
+            (lb_mode == kLbModeHost) ? "Host controls"  :
+                                       "Locked to fav";
         draw_text(kContentX, 48, hint);
-
-        send_lightbar_color(lb_r, lb_g, lb_b);
+        // No send here: lightbar_service() owns pushing the color to the
+        // controller every frame, on this screen and every other.
     } else {
         draw_text(kContentX, 30, "(no controller)");
     }
     draw_text(kContentX, 56, "R1=mode");
     flush_fb();
+}
+
+// Compute lb_r/lb_g/lb_b for an OLED lightbar mode (0..7). HOST (8) is handled
+// by the caller (no firmware color). noinline keeps the float/HSV literals out
+// of lightbar_service's / oled_loop's literal pool (same Thumb reach constraint
+// the render_screen_* functions hit).
+__attribute__((noinline))
+void lightbar_compute_mode(int mode, uint32_t now_ms) {
+    if (mode == 0) {
+        // LIVE: tilt -> RGB
+        int16_t ax, ay, az;
+        memcpy(&ax, &interrupt_in_data[21], 2);
+        memcpy(&ay, &interrupt_in_data[23], 2);
+        memcpy(&az, &interrupt_in_data[25], 2);
+        ax = imu_apply(3, ax);  // calibrated accel keeps the +-8192 == 1g scale below
+        ay = imu_apply(4, ay);
+        az = imu_apply(5, az);
+        const int rr = ((int)ax + 8192) * 255 / 16384;
+        const int gg = ((int)ay + 8192) * 255 / 16384;
+        const int bb = ((int)az + 8192) * 255 / 16384;
+        lb_r = (uint8_t)(rr < 0 ? 0 : rr > 255 ? 255 : rr);
+        lb_g = (uint8_t)(gg < 0 ? 0 : gg > 255 ? 255 : gg);
+        lb_b = (uint8_t)(bb < 0 ? 0 : bb > 255 ? 255 : bb);
+    } else if (mode <= 4) {
+        // FAV slot: fixed color
+        const int slot = mode - 1;
+        lb_r = lb_fav_r[slot];
+        lb_g = lb_fav_g[slot];
+        lb_b = lb_fav_b[slot];
+    } else if (mode == 5) {
+        // BREATHING: modulate FAV0 brightness with a sine wave (~3 s cycle)
+        const uint8_t phase = (uint8_t)(now_ms / 12);
+        const int s = sin_lut(phase); // -127..127
+        const uint16_t scale = (uint16_t)(32 + (s + 127) / 2); // 32..191
+        lb_r = (uint8_t)((lb_fav_r[0] * scale) / 255);
+        lb_g = (uint8_t)((lb_fav_g[0] * scale) / 255);
+        lb_b = (uint8_t)((lb_fav_b[0] * scale) / 255);
+    } else if (mode == 6) {
+        // RAINBOW: hue sweep over ~6 s
+        const uint16_t hue = (uint16_t)((now_ms / 17) % 360);
+        hsv_to_rgb(hue, 255, 255, &lb_r, &lb_g, &lb_b);
+    } else {
+        // FADE between FAV slots, 2 s per slot
+        const uint32_t kSlotMs = 2000;
+        const uint32_t total = now_ms % (4 * kSlotMs);
+        const int slot = (int)(total / kSlotMs);
+        const int next = (slot + 1) & 3;
+        const uint16_t blend = (uint16_t)(((total - slot * kSlotMs) * 256u) / kSlotMs);
+        lb_r = (uint8_t)((lb_fav_r[slot] * (255 - blend) + lb_fav_r[next] * blend) / 255);
+        lb_g = (uint8_t)((lb_fav_g[slot] * (255 - blend) + lb_fav_g[next] * blend) / 255);
+        lb_b = (uint8_t)((lb_fav_b[slot] * (255 - blend) + lb_fav_b[next] * blend) / 255);
+    }
+}
+
+// The single owner of the controller LED. Runs every frame (~10 Hz) from
+// oled_loop, on every screen, so a chosen mode "sticks" everywhere instead of
+// only while the Lightbar screen renders. Priority:
+//   1. Charging  -> amber-orange breathing pulse (status indicator).
+//   2. lb_mode != HOST -> the selected OLED mode/color.
+//   3. HOST (or disconnected) -> hand the LED back to the host/game.
+// When the firmware owns the LED it (a) writes state[] so the color rides every
+// host/audio packet and (b) actively pushes it via send_lightbar_color so it
+// updates even when the host is idle and animations keep moving. g_lightbar_
+// override gates state_update() so host AllowLedColor writes can't stomp us.
+__attribute__((noinline))
+void lightbar_service() {
+    if (!bt_is_connected()) { g_lightbar_override = false; return; }
+    const uint32_t now_ms = time_us_32() / 1000;
+
+    if (g_charge_eta.charging) {
+        // ~4.6 s breathing cycle (256 phase steps × 18 ms). Base amber
+        // (255,100,0) sine-enveloped from dim (24) to bright (240).
+        const uint8_t  phase = (uint8_t)(now_ms / 18);
+        const int      s     = sin_lut(phase);                          // -127..127
+        const uint16_t scale = (uint16_t)(24 + ((s + 127) * 216) / 254); // 24..240
+        lb_r = (uint8_t)((255u * scale) / 255u);
+        lb_g = (uint8_t)((100u * scale) / 255u);
+        lb_b = 0;
+    } else if (lb_mode == kLbModeHost) {
+        // Reflect the host's current LED on the OLED bars, then stand down.
+        state_get_led(&lb_r, &lb_g, &lb_b);
+        g_lightbar_override = false;
+        return;
+    } else {
+        lightbar_compute_mode(lb_mode, now_ms);
+    }
+
+    g_lightbar_override = true;
+    state_set_led(lb_r, lb_g, lb_b);  // ride every host/audio frame
+    if (!spk_active) {
+        // Active push so the LED updates when the host is idle and animations
+        // keep moving. Skipped during audio: the 0x36 frames already carry
+        // state[]'s LED at audio rate, and slipping a 0x31 between them would
+        // intrude on the load-bearing audio/haptic packet cadence.
+        send_lightbar_color(lb_r, lb_g, lb_b);
+    }
+}
+
+void lightbar_load_config() {
+    const Config_body& c = get_config();
+    lb_mode = c.lightbar_mode;
+    if (lb_mode < 0 || lb_mode >= kNumLbModes) lb_mode = kLbModeHost;
+    for (int i = 0; i < 4; i++) {
+        lb_fav_r[i] = c.lb_fav_r[i];
+        lb_fav_g[i] = c.lb_fav_g[i];
+        lb_fav_b[i] = c.lb_fav_b[i];
+    }
+    lb_dirty = false;
+}
+
+void lightbar_save_config() {
+    Config_body b = get_config();
+    b.lightbar_mode = (uint8_t)lb_mode;
+    for (int i = 0; i < 4; i++) {
+        b.lb_fav_r[i] = lb_fav_r[i];
+        b.lb_fav_g[i] = lb_fav_g[i];
+        b.lb_fav_b[i] = lb_fav_b[i];
+    }
+    set_config(b);
+    config_save();
+    lb_dirty = false;
 }
 
 __attribute__((noinline)) void render_screen_vu() {
@@ -1053,6 +1534,19 @@ void settings_adjust(int delta) {
             c.auto_haptics_lowpass = (uint8_t)v;
             break;
         }
+        case 11: { // screen_dim_timeout  [0,250] min, 0 = disabled
+            int v = (int)c.screen_dim_timeout + delta;
+            if (v < 0) v = 0; if (v > 250) v = 250;
+            c.screen_dim_timeout = (uint8_t)v;
+            break;
+        }
+        case 12: { // screen_off_timeout  [0,250] min, 0 = disabled
+            int v = (int)c.screen_off_timeout + delta;
+            if (v < 0) v = 0; if (v > 250) v = 250;
+            c.screen_off_timeout = (uint8_t)v;
+            break;
+        }
+        case 13: c.bt_mic_enable ^= 1; break; // BT mic on/off
     }
 }
 
@@ -1087,6 +1581,7 @@ void settings_handle_input() {
             config_default();
             if (config_save()) {
                 settings_local = get_config();
+                lightbar_load_config(); // refresh RAM lightbar state (no reboot here)
                 settings_dirty = false;
                 settings_save_status = "Reset!";
             } else {
@@ -1145,8 +1640,17 @@ __attribute__((noinline)) void format_settings_item(int idx, char* line, size_t 
             snprintf(line, n, "%s AH LP %s", cur, names[c.auto_haptics_lowpass & 3]);
             break;
         }
-        case 11: snprintf(line, n, "%s Reset to defaults", cur); break;
-        case 12: snprintf(line, n, "%s Wipe all slots", cur); break;
+        case 11:
+            if (c.screen_dim_timeout == 0) snprintf(line, n, "%s ScrDim off", cur);
+            else snprintf(line, n, "%s ScrDim %umin", cur, c.screen_dim_timeout);
+            break;
+        case 12:
+            if (c.screen_off_timeout == 0) snprintf(line, n, "%s ScrOff off", cur);
+            else snprintf(line, n, "%s ScrOff %umin", cur, c.screen_off_timeout);
+            break;
+        case 13: snprintf(line, n, "%s BT Mic %s", cur, c.bt_mic_enable ? "on" : "off"); break;
+        case 14: snprintf(line, n, "%s Reset to defaults", cur); break;
+        case 15: snprintf(line, n, "%s Wipe all slots", cur); break;
     }
 }
 
@@ -1314,6 +1818,40 @@ void oled_init() {
     sh1107_init();
     fb_clear();
     boot_splash();
+
+    // Restore the persisted lightbar mode + favorites (config_load() already ran
+    // in main() before this). Defaults to HOST passthrough on a fresh flash.
+    lightbar_load_config();
+}
+
+// Dim-tier renderer: blank the panel and draw a tiny "I'm alive" dot that
+// breathes (1s on / 1s off) and walks through 8 evenly-spaced positions every
+// ~30 s. Two goals: (1) reduce total pixel-on-time to a tiny fraction so the
+// panel barely glows even with the contrast register pinned, (2) prevent any
+// single pixel from accumulating wear. noinline keeps oled_loop's literal pool
+// in Thumb's 4 KB reach (same constraint the other render_screen_* hit).
+__attribute__((noinline))
+void render_dim_pulse(uint32_t dim_elapsed_us) {
+    fb_clear();
+    constexpr uint32_t kPulsePeriodUs = 2UL * 1000000UL; // 2 s blink cycle
+    constexpr uint32_t kPulseOnUs     = 1UL * 1000000UL; // 1 s on, 1 s off
+    constexpr uint32_t kPosStepUs     = 30UL * 1000000UL; // 30 s per position
+    constexpr int kPositions[][2] = {
+        { 16,  8}, { 64,  8}, {112,  8},
+        {112, 32},
+        {112, 56}, { 64, 56}, { 16, 56},
+        { 16, 32},
+    };
+    constexpr int kNumPositions = sizeof(kPositions) / sizeof(kPositions[0]);
+    const bool dot_on = (dim_elapsed_us % kPulsePeriodUs) < kPulseOnUs;
+    if (dot_on) {
+        const int idx = (int)((dim_elapsed_us / kPosStepUs) % (uint32_t)kNumPositions);
+        const int cx = kPositions[idx][0];
+        const int cy = kPositions[idx][1];
+        // 2x2 dot — small enough to barely register, big enough to see across a desk.
+        rect_filled(cx, cy, 2, 2);
+    }
+    flush_fb_raw(); // skip chrome arrows; nothing to navigate to from sleep
 }
 
 void oled_loop() {
@@ -1322,23 +1860,93 @@ void oled_loop() {
     rumble_burst_tick(now);
     if ((now - last_render_us) < kFrameUs) return;
     last_render_us = now;
-    // Bump activity on controller input changes (cheap rolling hash over input bytes)
+    // Track charge progress every frame — before the power-ladder early-returns
+    // below, so step timing stays correct even while the panel is dimmed/off.
+    sample_charge_eta();
+    // Parse the DS5's per-unit IMU calibration once it lands (no-op until then),
+    // so the tilt screen + tilt->RGB lightbar use corrected accel. See imu_apply().
+    imu_cal_service();
+    // Drive the controller LED every frame (any screen / power state): charging
+    // pulse, selected OLED mode, or hand-off to the host. See lightbar_service().
+    lightbar_service();
+    // Bump activity on controller input changes (cheap rolling hash over input
+    // bytes). Mirror bt.cpp's inactivity heuristic so resting-controller noise
+    // doesn't read as activity: the analog sticks (idata[0..3]) jitter by ±1 LSB
+    // at rest, so collapse their rest band [120,140] to a constant, and skip
+    // idata[6] (the volatile counter byte bt.cpp's idle check also ignores).
+    // Without this the dot/dim tier never engages while a controller is
+    // connected, because a stick flicker resets the idle timer every few frames.
     uint32_t hash = 0;
-    for (int i = 0; i < 10; i++) hash = hash * 31u + interrupt_in_data[i];
+    for (int i = 0; i < 10; i++) {
+        if (i == 6) continue;
+        uint8_t b = interrupt_in_data[i];
+        if (i < 4 && b >= 120 && b <= 140) b = 128; // stick deadzone
+        hash = hash * 31u + b;
+    }
     if (hash != last_input_hash) {
         last_input_hash = hash;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
+    // Rising-edge: BT-connect itself counts as activity, so the screen wakes
+    // the moment a controller pairs rather than waiting for the first input.
+    const bool bt_connected_now = bt_is_connected();
+    if (bt_connected_now && !prev_bt_connected) last_activity_us = time_us_64();
+    prev_bt_connected = bt_connected_now;
 
-    // Auto-dim after idle; respect user-selected brightness otherwise
-    const bool idle = (now - last_activity_us) > kAutoDimUs;
-    sh1107_set_contrast(idle ? kDimContrast : kBrightLevels[bright_idx]);
+    // Power-state ladder: Active → Dim (breathing dot) → Off based on idle time.
+    // Thresholds are user-configurable (minutes; 0 = that tier disabled) — #5.
+    // While charging we cap the ladder at Dim — the panel keeps doing the
+    // low-power breathing dot but never fully sleeps. This stops the user from
+    // unplugging the controller just to "wake" the dongle (which would reset the
+    // charge-ETA calibration). The dot tier already draws ~no current, so this
+    // costs little; sample_charge_eta() runs before this block regardless.
+    const uint64_t idle   = time_us_64() - last_activity_us;
+    const uint64_t dim_us = (uint64_t)get_config().screen_dim_timeout * 60ULL * 1000000ULL;
+    const uint64_t off_us = (uint64_t)get_config().screen_off_timeout * 60ULL * 1000000ULL;
+    const bool off_enabled = get_config().screen_off_timeout != 0;
+    const bool dim_enabled = get_config().screen_dim_timeout != 0;
+    if (off_enabled && idle > off_us && !g_charge_eta.charging) {
+        if (oled_power_state != OLED_OFF) {
+            cmd(0xAE);
+            oled_power_state = OLED_OFF;
+        }
+        return; // panel is off, nothing to draw
+    }
+    if (oled_power_state == OLED_OFF) cmd(0xAF); // wake panel before drawing
+    if (dim_enabled && idle > dim_us) {
+        sh1107_set_contrast(kDimContrast);
+        oled_power_state = OLED_DIM;
+        render_dim_pulse((uint32_t)(idle - dim_us));
+        return; // skip the regular per-screen render path
+    }
+    sh1107_set_contrast(kBrightLevels[bright_idx]);
+    oled_power_state = OLED_ACTIVE;
 
     // True on the first render after navigating to a different screen.
     // Lets a screen do expensive one-shot work on entry (the CPU screen
     // caches its frequency-counter measurement here).
     static int last_rendered_screen = -1;
     const bool screen_entered = (current_screen != last_rendered_screen);
+
+    // Leaving Trigger Test in either direction → reset the adaptive
+    // trigger preset to OFF and push it to the controller. Otherwise
+    // the last-cycled effect (Weapon snap, Galloping pulse, etc.)
+    // stays active on the DS5 indefinitely, which surprised users
+    // who'd just navigated away expecting a clean slate.
+    if (last_rendered_screen == kScreenTriggers
+        && current_screen != kScreenTriggers) {
+        trigger_preset = 0;
+        send_trigger_effect(0);
+    }
+
+    // Leaving the Lightbar screen → persist mode/favorite changes made there,
+    // batched into a single flash write instead of one per button press.
+    if (last_rendered_screen == kScreenLightbar
+        && current_screen != kScreenLightbar
+        && lb_dirty) {
+        lightbar_save_config();
+    }
+
     last_rendered_screen = current_screen;
 
     switch (current_screen) {

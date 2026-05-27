@@ -22,8 +22,17 @@ void bt_send_control(uint8_t *data, uint16_t len);
 void bt_write(const uint8_t *data, uint16_t len);
 void bt_get_signal_strength(int8_t *rssi);
 std::vector<uint8_t> get_feature_data(uint8_t reportId,uint16_t len);
+// Side-effect-free read of an already-cached feature report (empty vector if it
+// hasn't arrived yet). Unlike get_feature_data(), never issues an L2CAP request,
+// so it is safe to poll every frame — used by the OLED IMU-calibration parse.
+std::vector<uint8_t> bt_peek_feature(uint8_t reportId);
 void init_feature();
 void set_feature_data(uint8_t reportId, uint8_t* data,uint16_t len);
+
+// Connection-attempt watchdog: call once per main-loop iteration. Recovers a
+// stalled connection (auto re-inquiry) so a transient RF glitch — e.g. USB 3.0
+// 2.4 GHz interference — doesn't hang the dongle on the amber lightbar.
+void bt_connection_watchdog_tick();
 
 // OLED add-on accessors.
 bool bt_is_connected();
